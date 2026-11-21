@@ -194,6 +194,63 @@ def _child(files, nodeids, wfd):
     os._exit(0)
 
 
+def start_tpcds(src, files, indices, baseline=None):
+    """Fork a child that fingerprints these TPC-DS queries on the patched files
+    (see tpcds_check). Returns a handle for poll_json."""
+    global SRC
+    SRC = str(src)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+            os.chdir(SRC)
+            sys.path.insert(0, SRC)
+            sys.dont_write_bytecode = True
+            sys.meta_path.insert(0, _Overlay(files))
+            import tpcds_check
+
+            fp = tpcds_check.fingerprints(indices, baseline)
+            os.write(w, json.dumps({str(k): v for k, v in fp.items()}).encode())
+        except BaseException:  # noqa: BLE001
+            pass
+        os._exit(0)
+    os.close(w)
+    return {"pid": pid, "fd": r, "buf": b"", "t0": time.monotonic()}
+
+
+def poll_json(handle, timeout):
+    """Non-blocking: ("done", object) once the child wrote its answer,
+    ("failed", None) if it died, timed out or wrote nothing; None meanwhile."""
+    fd = handle["fd"]
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            break
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            os.close(fd)
+            _, _, ru = os.wait4(handle["pid"], 0)
+            handle["cpu"] = ru.ru_utime + ru.ru_stime
+            try:
+                return "done", json.loads(handle["buf"].decode())
+            except ValueError:
+                return "failed", None
+        handle["buf"] += chunk
+    if time.monotonic() - handle["t0"] > timeout:
+        try:
+            os.kill(handle["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.close(fd)
+        _, _, ru = os.wait4(handle["pid"], 0)
+        handle["cpu"] = ru.ru_utime + ru.ru_stime
+        return "failed", None
+    return None
+
+
 def start(files, nodeids):
     """Fork a child that runs nodeids on the patched files. Returns a handle."""
     r, w = os.pipe()

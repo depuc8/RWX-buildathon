@@ -173,6 +173,13 @@ def _import_reads(rows):
     return {k: {n: {t: sorted(m) for t, m in v.items()} for n, v in a.items()} for k, a in out.items()}
 
 
+def _site_index(sites):
+    out = defaultdict(list)
+    for f, l0, c0, l1, c1 in sites:
+        out[f].append(f"{l0}:{c0}:{l1}:{c1}")
+    return {f: sorted(v) for f, v in sorted(out.items())}
+
+
 def _group(pairs):
     out = defaultdict(set)
     for k, mod in pairs:
@@ -200,6 +207,9 @@ def main():
     class_users = defaultdict(lambda: defaultdict(int))
     opens = defaultdict(int)
     dirs = defaultdict(int)
+    imp_early = json.load(open(os.path.join(map_dir, "import.json")))
+    sites = imp_early.get("sites", [])
+    cond_users = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # file -> site -> outcome
     attr_users = defaultdict(lambda: defaultdict(int))  # class key -> attr -> mask
     key_users = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # class -> attr -> key
     subprocess_mask = 0
@@ -226,6 +236,9 @@ def main():
             dirs[p] |= b
         if d["subprocess"]:
             subprocess_mask |= b
+        for sid, code in d.get("conds", ()):
+            f, l0, c0, l1, c1 = sites[sid]
+            cond_users[f][f"{l0}:{c0}:{l1}:{c1}"][code] |= b
         mro = d.get("mro", {})
         keyed = set()
         for k, name, tok in d.get("keys", ()):
@@ -305,6 +318,11 @@ def main():
             for c, v in sorted(key_users.items())
         },
         "derived": sorted(derived_names(src_root)),
+        "conds": {
+            f: {k: {c: ref(m) for c, m in sorted(v.items())} for k, v in sorted(sv.items())}
+            for f, sv in sorted(cond_users.items())
+        },
+        "cond_sites": _site_index(sites),
     }
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     raw = json.dumps(out, separators=(",", ":")).encode()

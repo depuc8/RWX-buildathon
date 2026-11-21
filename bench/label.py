@@ -15,6 +15,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+WALL_LIMIT = int(os.environ.get("LABEL_WALL_LIMIT", 900))  # seconds per commit
 sys.path.insert(0, os.path.dirname(HERE))
 from selector import apply_hunks, parse_patch  # noqa: E402
 
@@ -65,7 +66,7 @@ def main():
             try:
                 build_tree(src, os.path.join(commits, cid + ".patch"), tree)
             except Exception as e:  # noqa: BLE001
-                print(f"{cid}: cannot apply patch: {e}", file=sys.stderr)
+                print(f"{cid}: cannot apply patch: {e}", file=sys.stderr, flush=True)
                 free.append(slot)
                 continue
             env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{tree}:{HERE}",
@@ -77,15 +78,19 @@ def main():
                 cwd=tree, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 preexec_fn=lambda cpus=cpus: os.sched_setaffinity(0, cpus),
             )
-            running[p] = (cid, slot, tree)
+            running[p] = (cid, slot, tree, time.time())
         time.sleep(0.5)
+        for p, (cid, slot, tree, started) in list(running.items()):
+            if p.poll() is None and time.time() - started > WALL_LIMIT:
+                print(f"{cid}: over {WALL_LIMIT}s, killed (left unlabeled)", file=sys.stderr, flush=True)
+                p.kill()
         for p in [p for p in running if p.poll() is not None]:
-            cid, slot, tree = running.pop(p)
+            cid, slot, tree, _ = running.pop(p)
             free.append(slot)
             shutil.rmtree(tree, ignore_errors=True)
             raw_path = os.path.join(out_dir, cid + ".raw")
             if not os.path.exists(raw_path):
-                print(f"{cid}: pytest died ({p.returncode})", file=sys.stderr)
+                print(f"{cid}: pytest died ({p.returncode})", file=sys.stderr, flush=True)
                 continue
             raw = json.load(open(raw_path))
             failing = set()

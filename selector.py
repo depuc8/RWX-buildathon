@@ -32,6 +32,11 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 HERE = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("BR_SRC", HERE / "src"))
 MAP = Path(os.environ.get("BR_MAP", HERE / "maps" / "brmap.json.gz"))
+TPCDS_MAP = Path(os.environ.get("BR_TPCDS_MAP", HERE / "maps" / "tpcds.json.gz"))
+TPCDS = os.environ.get("BR_TPCDS", "1") == "1"
+# Share of plan-phase-only patches whose TPC-DS plans come out identical
+# (about 0.4 on the local benches): what a check is expected to save.
+TPCDS_HIT_RATE = float(os.environ.get("BR_TPCDS_HIT_RATE", 0.4))
 
 MAX_WORKERS = 8
 WORKER_MS = 2000
@@ -65,6 +70,8 @@ class Map:
         self.eager = set(m.get("eager", ()))
         self.import_users = m.get("import_users", {})
         self.import_reads = m.get("import_reads", {})
+        self.conds = m.get("conds", {})
+        self.cond_sites = {f: set(v) for f, v in m.get("cond_sites", {}).items()}
         self.n_tests = n_tests
         self.all = (1 << n_tests) - 1
         self._module_users = {}
@@ -294,6 +301,13 @@ def has_pos(node):
 
 
 def start(node):
+    # A decorated def or class starts at its first decorator: Python puts its
+    # lineno on the `def`/`class` line, which would leave decorator lines
+    # outside every statement.
+    decorators = getattr(node, "decorator_list", None)
+    if decorators:
+        first = min(decorators, key=lambda d: (d.lineno, d.col_offset))
+        return min((node.lineno, node.col_offset), (first.lineno, first.col_offset - 1))
     return (node.lineno, node.col_offset)
 
 
@@ -352,7 +366,7 @@ class Tree:
                     if isinstance(child, FUNCS):
                         q = prefix + child.name
                         lo = min([child.lineno] + [d.lineno for d in child.decorator_list])
-                        self._funcs[q] = (lo, child.end_lineno)
+                        self._funcs[q] = (lo, child.end_lineno, child.body[0].lineno)
                         walk(child, q + ".<locals>.")
                     elif isinstance(child, ast.ClassDef):
                         walk(child, prefix + child.name + ".")
@@ -503,6 +517,8 @@ class Selector:
         """
         self.must = 0
         self.files = {}
+        self.touched = set()  # (file, line): old lines a change inside function bodies touches
+        self.nonline = False  # a change that is not just lines inside functions
         try:
             diffs = parse_patch(patch_text)
         except Exception as e:  # noqa: BLE001
@@ -594,9 +610,66 @@ class Selector:
         if all(is_trivial(x) for x in old_chunk + new_chunk) and not in_string(old, o0) and not in_string(new, n0):
             return 0
         a_old, b_old, a_new, b_new = narrow(old_chunk, new_chunk, o0, n0)
+        if all(x.isascii() for x in old_chunk + new_chunk):
+            refined = self.cond_change(f, old, new, a_old, b_old, a_new, b_new)
+            if refined is not None:
+                return refined
         mask = 0
         mask |= self.side_mask(f, old, new, a_old, b_old, "old", (a_old, b_old))
         mask |= self.side_mask(f, old, new, a_new, b_new, "new", (a_old, b_old))
+        return mask
+
+    def cond_change(self, f, old, new, a_old, b_old, a_new, b_new):
+        """A change that only swaps the operator of one `and`/`or` or one
+        comparison whose outcomes the map recorded: the tests whose recorded
+        evaluations could come out differently. None: analyse it as usual."""
+        m = self.m
+        sites = m.cond_sites.get(f)
+        if not sites:
+            return None
+        found_old = find_op_node(old.tree, a_old, b_old)
+        found_new = find_op_node(new.tree, a_new, b_new)
+        if found_old is None or found_new is None:
+            return None
+        onode, opath = found_old
+        nnode, _ = found_new
+        key = f"{onode.lineno}:{onode.col_offset}:{onode.end_lineno}:{onode.end_col_offset}"
+        if key not in sites or type(onode) is not type(nnode):
+            return None
+        if isinstance(onode, ast.BoolOp):
+            if len(onode.values) != len(nnode.values) or any(
+                ast.dump(x) != ast.dump(y) for x, y in zip(onode.values, nnode.values)
+            ):
+                return None
+            old_and, new_and = isinstance(onode.op, ast.And), isinstance(nnode.op, ast.And)
+            if old_and == new_and:
+                return None
+            truth = truth_only(opath, onode)
+
+            def differs(code):
+                return boolop_differs(code, len(onode.values), old_and, new_and, truth)
+        else:
+            if len(onode.ops) != 1 or len(nnode.ops) != 1:
+                return None
+            if ast.dump(onode.left) != ast.dump(nnode.left) or ast.dump(onode.comparators[0]) != ast.dump(
+                nnode.comparators[0]
+            ):
+                return None
+            oop, nop = type(onode.ops[0]).__name__, type(nnode.ops[0]).__name__
+            if oop == nop:
+                return None
+
+            def differs(code):
+                return compare_differs(code, oop, nop)
+
+        self.touched.update((f, ln) for ln in range(onode.lineno, onode.end_lineno + 1))
+        mask = 0
+        for code, i in m.conds.get(f, {}).get(key, {}).items():
+            if differs(code):
+                mask |= m.bits(i)
+        # Evaluations while modules import are not recorded per test.
+        mask |= m.import_impact(f, range(onode.lineno, onode.end_lineno + 1))
+        log(f"  {f}:{onode.lineno}: operator change, {bin(mask).count('1')} tests see a different outcome")
         return mask
 
     def side_mask(self, f, old, new, a, b, side, old_span):
@@ -613,10 +686,18 @@ class Selector:
             q = qualname(path, idx - 1) if isinstance(scope, ast.Lambda) else qualname(path, idx)
             if side == "old":
                 lines = runtime_lines(path, idx, a, b)
-                return self.lines_mask(f, lines)
+                mask = self.lines_mask(f, lines)
+                if q in ("__getattr__", "__dir__"):
+                    # A module's lazy attribute hook (PEP 562): its results are
+                    # cached in the module, so later importers never run it.
+                    mask |= m.module_impact(f)
+                return mask
             # New side: find the same function in the old tree and use the old
             # statements around where the new code went in.
-            return self.runtime_in_old(f, old, q, scope, old_span)
+            mask = self.runtime_in_old(f, old, q, scope, old_span)
+            if q in ("__getattr__", "__dir__"):
+                mask |= m.module_impact(f)
+            return mask
         if kind == "def":
             _, q, name, path, idx = c
             if side == "old":
@@ -625,6 +706,7 @@ class Selector:
                 return self.func_mask(f, old, q)
             return self.new_def_mask(f, old, path, idx, name)
         if kind == "class":
+            self.nonline = True
             _, path, idx = c
             cls = path[idx]
             cq = qualname(path, idx)
@@ -649,6 +731,7 @@ class Selector:
                 mask |= self.class_mask(f, cq)
             return mask
         # module level
+        self.nonline = True
         stmts = overlapping(tree.tree.body, a, b)
         mask = 0
         for s in stmts:
@@ -670,20 +753,41 @@ class Selector:
             mask |= m.module_impact(f)
         return mask
 
-    def lines_mask(self, f, lines):
+    def lines_mask(self, f, lines, import_lines=None):
         m = self.m
-        return m.line_users(f, lines) | m.import_impact(f, lines)
+        self.touched.update((f, ln) for ln in lines)
+        return m.line_users(f, lines) | m.import_impact(f, lines if import_lines is None else import_lines)
 
     def func_mask(self, f, old, q):
         r = old.funcs().get(q)
         if r is None:
             return self.m.module_impact(f)
         lines = range(r[0], r[1] + 1)
-        return self.lines_mask(f, lines)
+        mask = self.lines_mask(f, lines, import_lines=range(r[2], r[1] + 1))
+        if q in ("__getattr__", "__dir__"):
+            # A module's lazy attribute hook (PEP 562): what it resolves is
+            # cached in the module, so only the first importer ever ran it.
+            mask |= self.m.module_impact(f)
+        return mask
+
+    def outer_users(self, f, cq):
+        """Users of the classes enclosing cq (MySQL for MySQL.Tokenizer): a
+        dialect's metaclass copies settings of its nested Tokenizer, Parser and
+        Generator into the dialect when it is created."""
+        m = self.m
+        parts = cq.split(".")
+        mask = 0
+        for i in range(len(parts) - 1, 0, -1):
+            outer = ".".join(parts[:i])
+            if outer.endswith("<locals>"):
+                break
+            mask |= m.class_users(f, outer)
+        return mask
 
     def class_mask(self, f, cq):
         m = self.m
-        return m.class_users(f, cq) | m.eager_tests(f) | m.import_read_any(f"{f}::{cq}")
+        return (m.class_users(f, cq) | self.outer_users(f, cq) | m.eager_tests(f)
+                | m.import_read_any(f"{f}::{cq}"))
 
     def attr_mask(self, f, cq, s, a, b):
         """A class-body statement: if it just sets data attributes, only the
@@ -696,7 +800,7 @@ class Selector:
         if names & m.derived:
             # Built into something else when classes are created: every user
             # of the class, and modules that read it while importing.
-            mask = m.class_users(f, cq) | m.eager_tests(f)
+            mask = m.class_users(f, cq) | self.outer_users(f, cq) | m.eager_tests(f)
             for n in names:
                 mask |= m.import_read(ckey, n)
             return mask
@@ -716,6 +820,7 @@ class Selector:
 
     def new_def_mask(self, f, old, path, idx, name):
         m = self.m
+        self.nonline = True
         # A def that did not exist: it may override a method for every user of
         # the enclosing class, or shadow a module-level name.
         for i in range(idx - 1, -1, -1):
@@ -755,6 +860,120 @@ class Selector:
             lo, hi = stmt_lines(s)
             lines.update(range(lo, hi + 1))
         return self.lines_mask(f, lines)
+
+
+def _inside(node, a, b):
+    """Is the span [a, b] strictly inside node (a point at its very start or
+    end is an insertion next to it, not inside it)?"""
+    if not has_pos(node):
+        return False
+    if a == b:
+        return start(node) < a < end(node)
+    return start(node) <= a and b <= end(node)
+
+
+def find_op_node(tree, a, b):
+    """The innermost and/or or single comparison whose operator region holds
+    the span [a, b] (not inside one of its operands), with its path."""
+    path = path_to(tree, a, b)
+    for i in range(len(path) - 1, -1, -1):
+        node = path[i]
+        if isinstance(node, ast.BoolOp):
+            operands = node.values
+        elif isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+        else:
+            continue
+        if any(_inside(x, a, b) for x in operands):
+            return None
+        return node, path[: i + 1]
+    return None
+
+
+def truth_only(path, node):
+    """Is only the truth of this expression used (a condition), not its value?"""
+    i = len(path) - 1
+    while i > 0:
+        parent = path[i - 1]
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and parent.test is node:
+            return True
+        if isinstance(parent, ast.comprehension) and any(x is node for x in parent.ifs):
+            return True
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        if isinstance(parent, ast.BoolOp):
+            if parent.values[-1] is not node:
+                return True  # only its truth decides where evaluation stops
+            node, i = parent, i - 1  # last operand: its value is the parent's value
+            continue
+        return False
+    return False
+
+
+def boolop_differs(code, n, old_and, new_and, truth):
+    """Recorded evaluation `code` (one character per operand that ran: T/F
+    bools, 1/0 truth of other values, ? unknown, E raised) of an n-operand
+    and/or: does it come out differently with the other operator?"""
+    if "E" in code or "?" in code or not code:
+        return True
+    j = len(code) - 1  # operand whose value the old expression returned
+    k = None
+    for i in range(n):
+        if i >= len(code):
+            return True  # the new operator needs an operand that never ran
+        t = code[i] in "T1"
+        if i == n - 1 or t != new_and:
+            k = i
+            break
+    if truth:
+        return (code[j] in "T1") != (code[k] in "T1")
+    if k == j:
+        return False
+    return not (code[j] in "TF" and code[j] == code[k])
+
+
+def _flag(code, letter):
+    i = code.find(letter)
+    if i < 0 or i + 1 >= len(code):
+        return None
+    c = code[i + 1]
+    return True if c == "1" else False if c == "0" else None
+
+
+def compare_outcome(op, f):
+    e, l, g, i, n = f["e"], f["l"], f["g"], f["i"], f["n"]
+
+    def neg(x):
+        return None if x is None else not x
+
+    def either(x, y):
+        if x is True or y is True:
+            return True
+        if x is False and y is False:
+            return False
+        return None
+
+    return {
+        "Eq": e, "NotEq": neg(e), "Lt": l, "Gt": g, "LtE": either(l, e), "GtE": either(g, e),
+        "Is": i, "IsNot": neg(i), "In": n, "NotIn": neg(n),
+    }.get(op)
+
+
+def compare_differs(code, old_op, new_op):
+    """Recorded comparison flags (r result, e equal, l less, g greater,
+    i identical, n contained; ? unknown): does the new operator give a
+    different result?"""
+    if code == "E":
+        return True
+    f = {x: _flag(code, x) for x in "relgin"}
+    r = f["r"]
+    if r is None:
+        return True
+    old = compare_outcome(old_op, f)
+    new = compare_outcome(new_op, f)
+    if new is None or (old is not None and old != r):
+        return True
+    return new != r
 
 
 def may_raise(path, s):
@@ -977,6 +1196,85 @@ SIM_ANSWERS = os.environ.get("BR_SIM_ANSWERS")  # tune offline: labels stand in 
 PARALLEL = 2
 
 
+def load_tpcds(tests):
+    with gzip.open(TPCDS_MAP, "rb") as fh:
+        t = json.loads(fh.read())
+    num = {x["id"]: x["number"] for x in tests}.get(t["test"])
+    if num is None:
+        return None
+    return {
+        "num": num,
+        "baseline": {int(i): set(v) for i, v in t["baseline"].items()},
+        "data": {f: set(v) for f, v in t["data_lines"].items()},
+        "queries": {f: {int(ln): int(h, 16) for ln, h in v.items()} for f, v in t["query_lines"].items()},
+        "cost": {int(i): c for i, c in t.get("cost", {}).items()},
+    }
+
+
+def tpcds_queries(tp, sel, m, must, maybe):
+    """The TPC-DS queries whose plan-phase output must be recomputed to rule
+    out test_execute_tpcds, or None when the check cannot decide it."""
+    if tp is None:
+        return None
+    bit = 1 << tp["num"]
+    if not maybe & bit or must & bit or sel.nonline or not sel.touched:
+        return None
+    affected = 0
+    for f, ln in sel.touched:
+        if ln in tp["data"].get(f, ()):
+            return None  # code that runs while plans execute over data
+        if str(ln) in m.import_lines.get(f, {}):
+            return None  # runs at import: may change what the data phase uses
+        q = tp["queries"].get(f, {}).get(ln, 0)
+        if not q and m.line_users(f, [ln]) & bit:
+            # The test runs this line, but not inside anything the check
+            # recomputes (one-time setup such as dispatch caches, or code
+            # after the plan ran): the check cannot vouch for it.
+            return None
+        affected |= q
+    if not affected:
+        return None
+    # Cheapest first: one differing query decides, and is usually found early.
+    return sorted(numbers_of(affected, max(tp["baseline"]) + 1), key=lambda i: tp["cost"].get(i, 0))
+
+
+def run_tpcds_checks(tp, plans):
+    todo = [p for p in plans if p.get("tpcds")]
+    if not todo:
+        return
+    sys.path.insert(0, str(HERE))
+    import verify
+
+    queue, running = list(todo), []
+    while queue or running:
+        while queue and len(running) < PARALLEL:
+            p = queue.pop(0)
+            running.append((p, verify.start_tpcds(SRC, p["files"], p["tpcds"],
+                                                  {i: tp["baseline"][i] for i in p["tpcds"]})))
+        still = []
+        for p, h in running:
+            # A check runs about as long as its queries did at the pinned
+            # commit; far longer means the patch made sqlglot slow or loop,
+            # and then the real test would time out too.
+            res = verify.poll_json(h, 1.5 + 3 * sum(tp["cost"].get(i, 0.1) for i in p["tpcds"]))
+            if res is None:
+                still.append((p, h))
+                continue
+            status, fps = res
+            same = status == "done" and len(fps) == len(p["tpcds"]) and all(  # stopped early = differs
+                fps.get(str(i)) in tp["baseline"].get(i, ()) for i in p["tpcds"]
+            )
+            if same:
+                p["heavy"] &= ~(1 << tp["num"])
+                p["light"] &= ~(1 << tp["num"])
+            log(f"{p['commit']}: TPC-DS check over {len(p['tpcds'])} queries: "
+                f"{'identical, test_execute_tpcds dropped' if same else 'differs, kept'} "
+                f"({h.get('cpu', 0):.2f} s CPU)")
+        running = still
+        if running:
+            time.sleep(0.01)
+
+
 def numbers_of(mask, n):
     return [i for i in range(n) if mask >> i & 1]
 
@@ -995,6 +1293,7 @@ def main():
     heavy = sum(1 << t["number"] for t in tests if ms[t["number"]] >= HEAVY_MS)
     m = Map(MAP, n)
     sel = Selector(tests, m)
+    tp = load_tpcds(tests) if TPCDS and TPCDS_MAP.exists() else None
 
     plans = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
@@ -1003,7 +1302,17 @@ def main():
         light = maybe & ~heavy
         hv = maybe & heavy
         plan = {"commit": patch.stem, "must": must, "light": light, "heavy": hv, "files": files,
-                "verify": False}
+                "verify": False, "tpcds": tpcds_queries(tp, sel, m, must, maybe)}
+        if plan["tpcds"]:
+            # Worth checking only if dropping the test would really cut this
+            # commit's cost (another heavy test may set the pace anyway).
+            everything = numbers_of(must | maybe, n)
+            without = [i for i in everything if i != tp["num"]]
+            saving = cost_of(split(everything, ms), ms) - cost_of(split(without, ms), ms)
+            check_ms = 300 + 1050 * sum(tp["cost"].get(i, 0.1) for i in plan["tpcds"])
+            if TPCDS_HIT_RATE * saving <= check_ms:
+                log(f"  TPC-DS check skipped: saves {saving / 1000:.1f} s at best, costs ~{check_ms / 1000:.1f} s")
+                plan["tpcds"] = None
         if VERIFY and light:
             sum_l = sum(ms[i] for i in numbers_of(light, n))
             listed = cost_of(split(numbers_of(must | maybe, n), ms), ms)
@@ -1014,6 +1323,14 @@ def main():
                 plan["verify"] = True
                 plan["sum_l"] = sum_l
         plans.append(plan)
+
+    if os.environ.get("BR_DUMP"):
+        with open(os.environ["BR_DUMP"], "w") as fh:
+            for p in plans:
+                fh.write(json.dumps({k: numbers_of(p[k], n) for k in ("must", "light", "heavy")}
+                                    | {"commit": p["commit"]}) + "\n")
+
+    run_tpcds_checks(tp, plans)
 
     todo = [p for p in plans if p["verify"]]
     est_cpu = 0

@@ -16,9 +16,12 @@ dependency from another. Each child records:
   subprocess whether it spawned a process (its work is invisible to us)
 """
 
+import ast
 import concurrent.futures
 import enum
 import importlib
+import importlib.abc
+import importlib.machinery
 import json
 import os
 import pickle
@@ -202,6 +205,8 @@ def _p_audit(event, args):
 def pytest_configure(config):
     if CALIB:
         return
+    if COND:
+        install_conditions()
     M.use_tool_id(TOOL, "brmap")
     M.register_callback(TOOL, M.events.LINE, _p_line)
     M.register_callback(TOOL, M.events.PY_START, _p_start)
@@ -227,6 +232,242 @@ def _import_everything():
             Dialect.get_or_raise(d.value)
         except Exception as e:  # noqa: BLE001
             print(f"brmap: cannot load dialect {d.value}: {e}", file=sys.stderr)
+
+
+
+# ------------------------------------------------------- condition outcomes
+#
+# Every `and`/`or` and every single comparison inside sqlglot functions is
+# rewritten to record, per test, what it evaluated: the truth of each operand
+# that ran (short-circuit kept), and for a comparison whether its operands
+# were equal / ordered / identical. A patch that only flips an operator can
+# then be re-evaluated on exactly what each test saw. Extra facts are only
+# computed on plain values (no __eq__ or __bool__ of arbitrary objects), and
+# "?" marks anything unknown, which the selector treats as "may differ".
+
+COND = os.environ.get("BRMAP_CONDS", "1") == "1"
+SITES = []  # site index -> (file, lineno, col, end_lineno, end_col)
+_PLAIN = (type(None), bool, int, float, str, bytes)
+
+
+def _truth_code(v, decided=None):
+    """T/F for bools, 1/0 for other values whose truth is safe to know, ? else."""
+    if isinstance(v, bool):
+        return "T" if v else "F"
+    if decided is not None:
+        return "1" if decided else "0"
+    if isinstance(v, _PLAIN) or type(v) in (list, tuple, dict, set, frozenset):
+        return "1" if v else "0"
+    t = type(v)
+    if getattr(t, "__bool__", None) is None and getattr(t, "__len__", None) is None:
+        return "1"  # plain objects are always true
+    return "?"
+
+
+def _cond_record(sid, code):
+    # Not gated on rec.paused: that only hides attribute reads, and every
+    # evaluation must be recorded for the outcome sets to be complete.
+    rec = REC
+    if rec is not None:
+        rec.conds.add((sid, code))
+
+
+def _br_bool(sid, is_and, *thunks):
+    codes = []
+    last = len(thunks) - 1
+    v = None
+    for i, th in enumerate(thunks):
+        try:
+            v = th()
+        except BaseException:
+            codes.append("E")
+            _cond_record(sid, "".join(codes))
+            raise
+        if i == last:
+            codes.append(_truth_code(v))
+            break
+        b = bool(v)  # the same single truth test the original makes
+        codes.append(_truth_code(v, b))
+        if b != is_and:
+            break
+    _cond_record(sid, "".join(codes))
+    return v
+
+
+_EXPR_EQ = []
+
+
+def _expression_eq():
+    """sqlglot's Expression.__eq__: `self is other or (type(self) is
+    type(other) and hash(self) == hash(other))`."""
+    if not _EXPR_EQ:
+        cls = getattr(sys.modules.get("sqlglot.expressions.core"), "Expression", None)
+        _EXPR_EQ.append(cls.__dict__.get("__eq__") if cls is not None else None)
+    return _EXPR_EQ[0]
+
+
+def _safe_eq(a, b):
+    if isinstance(a, _PLAIN) and isinstance(b, _PLAIN):
+        return a == b
+    ea, eb = type(a).__eq__, type(b).__eq__
+    if ea is object.__eq__ and eb is object.__eq__:
+        return a is b
+    if (a is None and eb is object.__eq__) or (b is None and ea is object.__eq__):
+        return False
+    # An expression against None, a plain value or an expression of another
+    # type: Expression.__eq__ is False there without hashing anything (and
+    # plain values defer to it), so the outcome is known without calling it.
+    xe = _expression_eq()
+    if xe is not None and type(a) is not type(b):
+        if ea is xe and (eb is xe or isinstance(b, _PLAIN)):
+            return False
+        if eb is xe and (ea is xe or isinstance(a, _PLAIN)):
+            return False
+    return None
+
+
+def _code(x):
+    return "?" if x is None else ("1" if x else "0")
+
+
+def _br_cmp(sid, op, a, b):
+    try:
+        if op == "Eq":
+            r = a == b
+        elif op == "NotEq":
+            r = a != b
+        elif op == "Lt":
+            r = a < b
+        elif op == "LtE":
+            r = a <= b
+        elif op == "Gt":
+            r = a > b
+        elif op == "GtE":
+            r = a >= b
+        elif op == "Is":
+            r = a is b
+        elif op == "IsNot":
+            r = a is not b
+        elif op == "In":
+            r = a in b
+        else:
+            r = a not in b
+    except BaseException:
+        _cond_record(sid, "E")
+        raise
+    rec = REC
+    if rec is not None:
+        num = (isinstance(a, (int, float)) and isinstance(b, (int, float))) or (
+            isinstance(a, (str, bytes)) and type(a) is type(b)
+        )
+        lt = (a < b) if num else None
+        gt = (a > b) if num else None
+        eq = r if op == "Eq" else (not r if op == "NotEq" else _safe_eq(a, b))
+        ins = r if op == "In" else (not r if op == "NotIn" else None)
+        # r: result as bool (or ? if not a bool); e/l/g: equal/less/greater;
+        # i: identical; n: contained
+        rec.conds.add((sid, "r" + ("?" if not isinstance(r, bool) else _code(r))
+                       + "e" + _code(eq) + "l" + _code(lt) + "g" + _code(gt)
+                       + "i" + _code(a is b) + "n" + _code(ins)))
+    return r
+
+
+def _contains_unsafe(node):
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await, ast.NamedExpr)):
+            return True
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "super":
+            return True
+    return False
+
+
+class _CondRewriter(ast.NodeTransformer):
+    def __init__(self, relfile):
+        self.relfile = relfile
+        self.depth = 0  # inside a function or lambda
+
+    def _site(self, node):
+        SITES.append((self.relfile, node.lineno, node.col_offset, node.end_lineno, node.end_col_offset))
+        return len(SITES) - 1
+
+    def _func(self, node):
+        self.depth += 1
+        self.generic_visit(node)
+        self.depth -= 1
+        return node
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _func
+
+    def visit_ClassDef(self, node):
+        saved, self.depth = self.depth, 0
+        self.generic_visit(node)
+        self.depth = saved
+        return node
+
+    def visit_BoolOp(self, node):
+        unsafe = _contains_unsafe(node)
+        self.generic_visit(node)
+        if not self.depth or unsafe:
+            return node
+        sid = self._site(node)
+        thunks = [ast.Lambda(args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[],
+                                                defaults=[]), body=v) for v in node.values]
+        call = ast.Call(func=ast.Name(id="_brmap_bool", ctx=ast.Load()),
+                        args=[ast.Constant(sid), ast.Constant(isinstance(node.op, ast.And)), *thunks],
+                        keywords=[])
+        return ast.copy_location(call, node)
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if not self.depth or len(node.ops) != 1:
+            return node
+        sid = self._site(node)
+        call = ast.Call(func=ast.Name(id="_brmap_cmp", ctx=ast.Load()),
+                        args=[ast.Constant(sid), ast.Constant(type(node.ops[0]).__name__),
+                              node.left, node.comparators[0]],
+                        keywords=[])
+        return ast.copy_location(call, node)
+
+
+class _CondLoader(importlib.abc.SourceLoader):
+    def __init__(self, fullname, path):
+        self.fullname = fullname
+        self.path = path
+
+    def get_filename(self, fullname):
+        return self.path
+
+    def get_data(self, path):
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def source_to_code(self, data, path, *, _optimize=-1):
+        tree = ast.parse(data, filename=path)
+        tree = _CondRewriter(rel(path)).visit(tree)
+        ast.fix_missing_locations(tree)
+        return compile(tree, path, "exec", dont_inherit=True)
+
+    def get_code(self, fullname):  # never use cached bytecode
+        return self.source_to_code(self.get_data(self.path), self.path)
+
+
+class _CondFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "sqlglot" and not fullname.startswith("sqlglot."):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or not spec.origin or not spec.origin.endswith(".py"):
+            return spec
+        spec.loader = _CondLoader(fullname, spec.origin)
+        return spec
+
+
+def install_conditions():
+    import builtins
+
+    builtins._brmap_bool = _br_bool
+    builtins._brmap_cmp = _br_cmp
+    sys.meta_path.insert(0, _CondFinder())
 
 
 # ------------------------------------------------------- class attribute reads
@@ -435,6 +676,7 @@ class Recorder:
         self.cinfo = {}
         self.attr_reads = set()
         self.key_reads = set()
+        self.conds = set()
         self.paused = False
 
     def on_line(self, code, line):
@@ -553,6 +795,7 @@ def _run_child(item, number):
         "attrs": attrs,
         "keys": keys,
         "mro": mro,
+        "conds": sorted([sid, code] for sid, code in rec.conds),
     }
     tmp = f"{OUT}/tests/{number}.json.tmp"
     with open(tmp, "w") as fh:
@@ -581,6 +824,7 @@ def pytest_runtestloop(session):
                 "import_lines": sorted([f, ln, sorted(m)] for (f, ln), m in import_lines.items()),
                 "collect_opens": {p: sorted(v) for p, v in sorted(collect_opens.items())},
                 "tracked": tracked,
+                "sites": SITES,
                 "import_reads": sorted(
                     {(k, name, tok or "", mod) for cls, name, tok, mod in import_reads
                      for b in getattr(cls, "__mro__", ()) if (k := class_key(b))}

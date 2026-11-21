@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -57,6 +58,11 @@ class Map:
         self.subprocess = self.bits(m["subprocess"])
         self.import_lines = m["import_lines"]
         self.importers = m["importers"]
+        self.attrs = m.get("attrs", {})
+        self.keys = m.get("keys", {})
+        self.derived = set(m.get("derived", ()))
+        self.tracked = set(m.get("tracked", ()))
+        self.eager = set(m.get("eager", ()))
         self.n_tests = n_tests
         self.all = (1 << n_tests) - 1
         self._module_users = {}
@@ -85,6 +91,15 @@ class Map:
         i = self.classes.get(f, {}).get(qualname)
         return 0 if i is None else self.bits(i)
 
+    def attr_users(self, ckey, name):
+        """Tests that read class attribute `name` through this class or a subclass."""
+        i = self.attrs.get(ckey, {}).get(name)
+        return 0 if i is None else self.bits(i)
+
+    def key_users(self, ckey, name, tok):
+        i = self.keys.get(ckey, {}).get(name, {}).get(tok)
+        return 0 if i is None else self.bits(i)
+
     def module_users(self, f):
         """Tests that touched module f at all."""
         m = self._module_users.get(f)
@@ -101,10 +116,15 @@ class Map:
 
     def module_impact(self, f):
         """A module-level change to f: f's users and its importers' users."""
-        m = self.module_users(f) | self.subprocess
+        m = self.module_users(f) | self.eager_tests(f)
         for g in self.importers.get(f, ()):
             m |= self.module_users(g)
         return m
+
+    def eager_tests(self, f):
+        """Tests that run `import sqlglot` in a subprocess (we cannot see
+        inside it): reachable by import-time changes to eagerly loaded modules."""
+        return self.subprocess if f in self.eager else 0
 
     def import_impact(self, f, lines):
         imp = self.import_lines.get(f)
@@ -117,7 +137,7 @@ class Map:
                 for mod in mods:
                     m |= self.all if mod == "?" else self.module_impact(mod)
         if m:
-            m |= self.subprocess
+            m |= self.eager_tests(f)
         return m
 
 
@@ -447,65 +467,75 @@ class Selector:
 
     # -- one commit
     def select(self, patch_text):
+        """(must, maybe, files) for one patch.
+
+        must   tests to select no matter what: readers of changed non-Python
+               files, broken or deleted modules, anything we cannot analyse
+        maybe  tests reached through changed Python code, which running the
+               patched code can confirm or rule out
+        files  path -> patched text of every changed Python file
+        """
+        self.must = 0
+        self.files = {}
         try:
             diffs = parse_patch(patch_text)
         except Exception as e:  # noqa: BLE001
             log(f"  unparseable patch ({e}); selecting everything")
-            return self.m.all
+            return self.m.all, 0, {}
         if not diffs:
             log("  empty patch")
-            return 0
-        mask = 0
+            return 0, 0, {}
+        maybe = 0
         for d in diffs:
             try:
-                fm = self.file_mask(d)
+                maybe |= self.file_mask(d)
             except Exception as e:  # noqa: BLE001
                 log(f"  {d.old or d.new}: analysis failed ({e!r}); selecting everything")
-                fm = self.m.all
-            mask |= fm
-        return mask
+                self.must |= self.m.all
+        return self.must, maybe & ~self.must, self.files
 
     def file_mask(self, d):
         m = self.m
         paths = [p for p in (d.old, d.new) if p]
-        mask = 0
         for p in paths:
             base = os.path.basename(p)
             if p in ALL_FILES or base == "conftest.py":
                 log(f"  {p}: test configuration; selecting everything")
-                return m.all
+                self.must |= m.all
+                return 0
         # Readers of either path, and listers of the directories it is in.
         for p in paths:
             i = m.opens.get(p)
             if i is not None:
-                mask |= m.bits(i)
+                self.must |= m.bits(i)
             for tf in m.collect_opens.get(p, ()):
-                mask |= m.all if tf == "?" else TESTS_BY_FILE.get(tf, 0)
+                self.must |= m.all if tf == "?" else TESTS_BY_FILE.get(tf, 0)
         if d.old != d.new or d.old is None or d.new is None:
             for p in paths:
                 parent = os.path.dirname(p)
                 while True:
                     i = m.dirs.get(parent or ".")
                     if i is not None:
-                        mask |= m.bits(i)
+                        self.must |= m.bits(i)
                     if not parent:
                         break
                     parent = os.path.dirname(parent)
         if d.binary:
-            return mask
+            return 0
 
         py = [p for p in paths if p.endswith(".py") and (p.startswith("sqlglot/") or p.startswith("tests/"))]
         if not py:
-            return mask
+            return 0
 
         if d.old is None:
             # A new module runs only if something imports it, and that
             # importer's change is analysed on its own.
             log(f"  {d.new}: new file")
-            return mask | m.subprocess
+            return 0
         if d.new is None or d.old != d.new:
             log(f"  {d.old}: deleted or renamed module")
-            return mask | m.module_impact(d.old)
+            self.must |= m.module_impact(d.old)
+            return 0
 
         f = d.old
         old_text = self.old_text(f)
@@ -519,13 +549,15 @@ class Selector:
             new = Tree(new_text)
         except SyntaxError as e:
             log(f"  {f}: no longer parses ({e.msg}); module impact")
-            return mask | m.module_impact(f)
+            self.must |= m.module_impact(f)
+            return 0
+        self.files[f] = new_text
         if ast.dump(old.tree) == ast.dump(new.tree):
             log(f"  {f}: same syntax tree (comments or formatting)")
-            return mask
+            return 0
+        mask = 0
         for g in groups:
-            gm = self.group_mask(f, old, new, old_lines, new_lines, g)
-            mask |= gm
+            mask |= self.group_mask(f, old, new, old_lines, new_lines, g)
         return mask
 
     def group_mask(self, f, old, new, old_lines, new_lines, group):
@@ -581,8 +613,12 @@ class Selector:
                         mask |= m.class_users(f, cq)
                 elif isinstance(s, ast.ClassDef):
                     mask |= m.class_users(f, f"{cq}.{s.name}") | m.class_users(f, cq)
+                elif may_raise(path, s):
+                    # Class bodies run at import: if this one now raises, the
+                    # whole module fails to import.
+                    mask |= m.module_impact(f)
                 else:
-                    mask |= self.class_mask(f, cq)
+                    mask |= self.attr_mask(f, cq, s, a, b)
             if not stmts and side == "new":
                 mask |= self.class_mask(f, cq)
             return mask
@@ -597,7 +633,7 @@ class Selector:
                     mask |= m.module_impact(f)
             elif isinstance(s, ast.ClassDef):
                 if side == "old" or s.name in old.toplevel_names():
-                    mask |= m.class_users(f, s.name) | m.subprocess
+                    mask |= m.class_users(f, s.name) | m.eager_tests(f)
             else:
                 mask |= m.module_impact(f)
             if side == "old" and a <= start(s) and end(s) <= b:
@@ -621,10 +657,28 @@ class Selector:
 
     def class_mask(self, f, cq):
         m = self.m
-        mask = m.class_users(f, cq)
-        # Class bodies run at import time; anything built from them while
-        # importing (e.g. a subclass copying a dict) reaches that module's users.
-        return mask | m.subprocess
+        return m.class_users(f, cq) | m.eager_tests(f)
+
+    def attr_mask(self, f, cq, s, a, b):
+        """A class-body statement: if it just sets data attributes, only the
+        tests that read them (or the dict keys that changed) can see it."""
+        m = self.m
+        ckey = f"{f}::{cq}"
+        names = assigned_names(s)
+        if not names or ckey not in m.tracked or names & m.derived:
+            return self.class_mask(f, cq)
+        toks = None
+        if len(names) == 1 and isinstance(getattr(s, "value", None), ast.Dict):
+            toks = dict_entry_tokens(s.value, a, b)
+        mask = m.eager_tests(f)
+        for n in names:
+            if toks is None:
+                mask |= m.attr_users(ckey, n)
+            else:
+                mask |= m.key_users(ckey, n, "*")
+                for t in toks:
+                    mask |= m.key_users(ckey, n, t)
+        return mask
 
     def new_def_mask(self, f, old, path, idx, name):
         m = self.m
@@ -667,6 +721,70 @@ class Selector:
             lo, hi = stmt_lines(s)
             lines.update(range(lo, hi + 1))
         return self.lines_mask(f, lines)
+
+
+def may_raise(path, s):
+    """Does the change at the end of `path` (inside statement s) touch an
+    operation that could now raise when the statement runs, like `+` turned
+    into `-` on two lists? A change inside a literal cannot."""
+    if not path or path[-1] is s or s not in path:
+        return False
+    node = path[-1]
+    if isinstance(node, ast.UnaryOp):
+        return not isinstance(node.operand, ast.Constant)
+    return isinstance(node, (ast.BinOp, ast.BoolOp, ast.Compare, ast.Subscript))
+
+
+def assigned_names(s):
+    """Names a plain class-level assignment binds, or None for anything else."""
+    if isinstance(s, ast.Assign):
+        targets = s.targets
+    elif isinstance(s, ast.AnnAssign):
+        targets = [s.target]
+    else:
+        return None
+    names = set()
+    for t in targets:
+        if not isinstance(t, ast.Name):
+            return None
+        names.add(t.id)
+    return names
+
+
+def static_key(node):
+    """The token a dict key is recorded under at runtime (str, class or enum
+    member name, number), or None when it cannot be known statically."""
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (int, float, bool)) or v is None:
+            return repr(v)
+        return None
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def dict_entry_tokens(d, a, b):
+    """Keys of the entries of dict display d that the span [a, b] touches, or
+    None if it touches the dict's structure or an entry with a dynamic key."""
+    if not (start(d) < a and b < end(d)):
+        return None
+    toks = set()
+    for k, v in zip(d.keys, d.values):
+        lo = start(k) if k is not None else start(v)
+        hi = end(v)
+        if (a == b and lo <= a <= hi) or (a != b and lo < b and a < hi):
+            if k is None:
+                return None
+            tok = static_key(k)
+            if tok is None:
+                return None
+            toks.add(tok)
+    return toks
 
 
 def find_func(tree, q):
@@ -805,28 +923,112 @@ def split(numbers, ms):
     return best[1]
 
 
+# ------------------------------------------------------------ verification
+#
+# Listing a test costs its seconds on one of up to 8 parallel workers; running
+# it here costs its seconds of CPU. So we only run the cheap candidates, and
+# only when the best outcome (they all pass) beats listing everything.
+
+HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", 1500))  # never run these here
+VERIFY_MAX_MS = int(os.environ.get("BR_VERIFY_MAX_MS", 4000))
+OVERHEAD_MS = int(os.environ.get("BR_OVERHEAD_MS", 500))  # per verification
+# Drop the heavy candidates when every cheap test reaching the same code passes.
+BET = os.environ.get("BR_BET", "1") == "1"
+VERIFY = os.environ.get("BR_VERIFY", "0") == "1"  # off until CPU and the bet are validated
+SIM_ANSWERS = os.environ.get("BR_SIM_ANSWERS")  # tune offline: labels stand in for runs
+PARALLEL = 2
+
+
+def numbers_of(mask, n):
+    return [i for i in range(n) if mask >> i & 1]
+
+
+def cost_of(workers, ms):
+    return (max(sum(ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    n = len(tests)
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    ids = {t["number"]: t["id"] for t in tests}
     for t in tests:
         TESTS_BY_FILE[t["file"]] = TESTS_BY_FILE.get(t["file"], 0) | (1 << t["number"])
-    m = Map(MAP, len(tests))
+    heavy = sum(1 << t["number"] for t in tests if ms[t["number"]] >= HEAVY_MS)
+    m = Map(MAP, n)
     sel = Selector(tests, m)
-    total = 0
+
+    plans = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         log(f"{patch.stem}:")
-        mask = sel.select(patch.read_text(encoding="utf-8", errors="replace"))
-        numbers = [n for n in range(len(tests)) if mask >> n & 1]
-        workers = split(numbers, ms)
-        cost = (max(sum(ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
-        total += cost
-        log(f"  -> {len(numbers)} tests, {len(workers)} workers, {cost / 1000:.1f} s")
-        print(json.dumps({"commit": patch.stem, "workers": workers}), flush=True)
+        must, maybe, files = sel.select(patch.read_text(encoding="utf-8", errors="replace"))
+        light = maybe & ~heavy
+        hv = maybe & heavy
+        plan = {"commit": patch.stem, "must": must, "light": light, "heavy": hv, "files": files,
+                "verify": False}
+        if VERIFY and light:
+            sum_l = sum(ms[i] for i in numbers_of(light, n))
+            listed = cost_of(split(numbers_of(must | maybe, n), ms), ms)
+            keep = must if BET else must | hv
+            best = OVERHEAD_MS + sum_l + cost_of(split(numbers_of(keep, n), ms), ms)
+            if sum_l <= VERIFY_MAX_MS and best < listed:
+                plan["verify"] = True
+                plan["sum_l"] = sum_l
+        plans.append(plan)
+
+    todo = [p for p in plans if p["verify"]]
+    est_cpu = 0
+    if todo and SIM_ANSWERS:
+        answers = json.load(open(SIM_ANSWERS))["commits"]
+        for p in todo:
+            failing = set(answers.get(p["commit"], {}).get("failing", ()))
+            p["failed"] = sum(1 << i for i in numbers_of(p["light"], n) if i in failing)
+            est_cpu += OVERHEAD_MS + p["sum_l"]
+    elif todo:
+        sys.path.insert(0, str(HERE))  # python -I leaves the script's folder off the path
+        import verify
+
+        verify.warm_up(SRC)
+        queue = list(todo)
+        running = []
+        while queue or running:
+            while queue and len(running) < PARALLEL:
+                p = queue.pop(0)
+                nodeids = [ids[i] for i in numbers_of(p["light"], n)]
+                running.append((p, verify.start(p["files"], nodeids),
+                                10 + 5 * p["sum_l"] / 1000))
+            still = []
+            for p, h, timeout in running:
+                failed = verify.poll(h, timeout)
+                if failed is None:
+                    still.append((p, h, timeout))
+                else:
+                    num = {v: k for k, v in ids.items()}
+                    p["failed"] = sum(1 << num[x] for x in failed if x in num)
+            running = still
+            if running:
+                time.sleep(0.01)
+
+    total = 0
+    for p in plans:
+        if p["verify"]:
+            failed = p["failed"]
+            keep_heavy = p["heavy"] if (failed or not BET) else 0
+            mask = p["must"] | failed | keep_heavy
+            log(f"{p['commit']}: verified {bin(p['light']).count('1')} cheap tests, "
+                f"{bin(failed).count('1')} failed; heavy {'kept' if keep_heavy else 'dropped'}")
+        else:
+            mask = p["must"] | p["light"] | p["heavy"]
+        workers = split(numbers_of(mask, n), ms)
+        total += cost_of(workers, ms)
+        print(json.dumps({"commit": p["commit"], "workers": workers}), flush=True)
     import resource
 
     ru = resource.getrusage(resource.RUSAGE_SELF)
-    log(f"estimated simulated seconds (no misses): {total / 1000:.1f}")
-    log(f"selector CPU: {ru.ru_utime + ru.ru_stime:.2f} s")
+    rc = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime
+    log(f"verified {len(todo)} commits; estimated simulated seconds (no misses): {total / 1000:.1f}")
+    log(f"selector CPU: {cpu + est_cpu / 1000:.2f} s" + (" (simulated)" if SIM_ANSWERS else ""))
 
 
 if __name__ == "__main__":

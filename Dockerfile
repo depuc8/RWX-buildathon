@@ -10,8 +10,8 @@ RUN mkdir -p /app/src \
     && rm /tmp/sqlglot.tar.gz \
     && test -f /app/src/sqlglot/parser.py
 
-COPY selector.py /app/selector.py
+COPY selector.py verify.py /app/
 COPY maps /app/maps
-RUN chmod -R a+rX /app && python -m compileall -q /app/selector.py
+RUN chmod -R a+rX /app && python -m compileall -q /app/selector.py /app/verify.py
 
 CMD ["python", "-I", "/app/selector.py"]

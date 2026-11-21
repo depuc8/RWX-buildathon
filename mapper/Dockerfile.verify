@@ -1,0 +1,23 @@
+# The scorer builds this on linux/amd64 and runs it with no network. The
+# digest is the image every commit was labeled in: its Python and packages
+# decide how sqlglot's tests behave, and we run some of them.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+# The exact packages the labels were made with (pytest, duckdb, pandas, ...).
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -q -r /tmp/requirements.lock && rm /tmp/requirements.lock
+
+# sqlglot at the pinned commit: the selector reads the old source of every
+# file a patch touches, and runs tests against it.
+ADD https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz /tmp/sqlglot.tar.gz
+RUN mkdir -p /app/src \
+    && tar xzf /tmp/sqlglot.tar.gz -C /app/src --strip-components=1 \
+    && rm /tmp/sqlglot.tar.gz \
+    && test -f /app/src/sqlglot/parser.py \
+    && python -m compileall -q /app/src/sqlglot /app/src/tests
+
+COPY selector.py verify.py /app/
+COPY maps /app/maps
+RUN python -m compileall -q /app/selector.py /app/verify.py && chmod -R a+rX /app
+
+CMD ["python", "-I", "/app/selector.py"]

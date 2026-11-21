@@ -17,6 +17,7 @@ dependency from another. Each child records:
 """
 
 import concurrent.futures
+import enum
 import importlib
 import json
 import os
@@ -177,6 +178,159 @@ def _import_everything():
             print(f"brmap: cannot load dialect {d.value}: {e}", file=sys.stderr)
 
 
+# ------------------------------------------------------- class attribute reads
+#
+# Every data attribute of a sqlglot class is replaced by a descriptor that
+# records which class it was looked up through, and dict values by a dict that
+# records which keys were looked up (or that the whole dict was used). A
+# class-level change to one setting then reaches only the tests that read it.
+
+WHOLE = "*"
+
+
+def _ktok(key):
+    if isinstance(key, str):
+        return key
+    if isinstance(key, type):
+        return key.__name__
+    if isinstance(key, enum.Enum):
+        return key.name
+    if isinstance(key, (int, float, bool)) or key is None:
+        return repr(key)
+    return "?"
+
+
+class Tracked:
+    __slots__ = ("value", "name")
+
+    def __init__(self, value, name):
+        self.value = value
+        self.name = name
+
+    def __get__(self, obj, owner=None):
+        rec = REC
+        if rec is not None and not rec.paused:
+            rec.attr_reads.add((owner if owner is not None else type(obj), self.name))
+        return self.value
+
+
+def _key_read(d, key):
+    rec = REC
+    owner = getattr(d, "_br_owner", None)
+    if rec is not None and not rec.paused and owner is not None:
+        rec.key_reads.add((owner, d._br_name, key))
+
+
+class TDict(dict):
+    def __getitem__(self, k):
+        _key_read(self, _ktok(k))
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        _key_read(self, _ktok(k))
+        return dict.get(self, k, default)
+
+    def __contains__(self, k):
+        _key_read(self, _ktok(k))
+        return dict.__contains__(self, k)
+
+    def setdefault(self, k, default=None):
+        _key_read(self, _ktok(k))
+        return dict.setdefault(self, k, default)
+
+    def pop(self, k, *default):
+        _key_read(self, _ktok(k))
+        return dict.pop(self, k, *default)
+
+
+def _whole(name):
+    base = getattr(dict, name)
+
+    def method(self, *args, **kwargs):
+        _key_read(self, WHOLE)
+        return base(self, *args, **kwargs)
+
+    method.__name__ = name
+    return method
+
+
+for _name in ("__iter__", "keys", "values", "items", "__len__", "copy", "__or__", "__ror__",
+              "__eq__", "__ne__", "__reversed__", "popitem", "__reduce_ex__"):
+    setattr(TDict, _name, _whole(_name))
+
+
+def _tdict(value, owner, name):
+    d = TDict(value)
+    d._br_owner = owner
+    d._br_name = name
+    return d
+
+
+def install_tracking():
+    import sqlglot.generator as generator_mod
+
+    seen = set()
+
+    def walk(cls, modname):
+        if not isinstance(cls, type) or cls in seen or cls.__module__ != modname:
+            return
+        seen.add(cls)
+        if isinstance(cls, enum.EnumMeta):
+            return
+        for name, v in list(cls.__dict__.items()):
+            if name.startswith("__") or name.startswith("_abc"):
+                continue
+            if isinstance(v, type):
+                walk(v, modname)
+                continue
+            if callable(v) or hasattr(type(v), "__get__") or hasattr(type(v), "__set__"):
+                continue
+            if type(v) is dict:
+                v = _tdict(v, cls, name)
+            type.__setattr__(cls, name, Tracked(v, name))
+
+    for modname, mod in list(sys.modules.items()):
+        if modname == "sqlglot" or modname.startswith("sqlglot."):
+            for obj in list(vars(mod).values()):
+                walk(obj, modname)
+
+    # The generator copies TRANSFORMS into a per-class dispatch table on first
+    # use; keep tracking key lookups through that copy.
+    orig = generator_mod._build_dispatch
+
+    def build_dispatch(cls):
+        rec = REC
+        if rec is not None:
+            rec.paused = True
+        try:
+            d = orig(cls)
+        finally:
+            if rec is not None:
+                rec.paused = False
+        return _tdict(d, cls, "TRANSFORMS")
+
+    generator_mod._build_dispatch = build_dispatch
+    generator_mod._DISPATCH_CACHE.clear()
+
+    # Caches filled while importing would hide reads from the tests.
+    import functools
+    import gc
+
+    for obj in gc.get_objects():
+        if isinstance(obj, functools._lru_cache_wrapper):
+            mod = getattr(obj, "__module__", "") or ""
+            if mod.startswith("sqlglot"):
+                obj.cache_clear()
+    print(f"brmap: tracking attributes of {len(seen)} classes", file=sys.stderr)
+    return sorted(k for k in (class_key(c) for c in seen) if k)
+
+
+def class_key(k):
+    mod = sys.modules.get(getattr(k, "__module__", None) or "")
+    f = rel(getattr(mod, "__file__", None) or "")
+    return f"{f}::{k.__qualname__}" if f else None
+
+
 # ----------------------------------------------------------------- child phase
 
 class Recorder:
@@ -188,6 +342,9 @@ class Recorder:
         self.subprocess = False
         self.failed = []
         self.cinfo = {}
+        self.attr_reads = set()
+        self.key_reads = set()
+        self.paused = False
 
     def on_line(self, code, line):
         r = rel(code.co_filename)
@@ -267,6 +424,16 @@ def _run_child(item, number):
     lines = defaultdict(list)
     for f, ln in rec.lines:
         lines[f].append(ln)
+    mro = {}
+
+    def key_with_mro(cls):
+        k = class_key(cls)
+        if k is not None and k not in mro:
+            mro[k] = [x for x in (class_key(b) for b in cls.__mro__) if x]
+        return k
+
+    attrs = sorted({(k, name) for cls, name in rec.attr_reads if (k := key_with_mro(cls))})
+    keys = sorted({(k, name, tok) for cls, name, tok in rec.key_reads if (k := key_with_mro(cls))})
     data = {
         "number": number,
         "id": item.nodeid,
@@ -278,6 +445,9 @@ def _run_child(item, number):
         "opens": sorted(rec.opens),
         "dirs": sorted(rec.dirs),
         "subprocess": rec.subprocess,
+        "attrs": attrs,
+        "keys": keys,
+        "mro": mro,
     }
     tmp = f"{OUT}/tests/{number}.json.tmp"
     with open(tmp, "w") as fh:
@@ -294,6 +464,7 @@ def pytest_runtestloop(session):
     M.set_events(TOOL, 0)
     M.free_tool_id(TOOL)
     _parent_active = False
+    tracked = install_tracking()
 
     os.makedirs(f"{OUT}/tests", exist_ok=True)
     with open(f"{OUT}/import.json", "w") as fh:
@@ -301,6 +472,7 @@ def pytest_runtestloop(session):
             {
                 "import_lines": sorted([f, ln, sorted(m)] for (f, ln), m in import_lines.items()),
                 "collect_opens": {p: sorted(v) for p, v in sorted(collect_opens.items())},
+                "tracked": tracked,
             },
             fh,
         )

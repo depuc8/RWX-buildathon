@@ -62,6 +62,9 @@ class Map:
         self.dirs = m["dirs"]
         self.subprocess = self.bits(m["subprocess"])
         self.import_lines = m["import_lines"]
+        # Only the lines that function or lambda code ran while importing: a
+        # change inside a body has an import-time effect only if those ran.
+        self.import_func_lines = m.get("import_func_lines", self.import_lines)
         self.importers = m["importers"]
         self.attrs = m.get("attrs", {})
         self.keys = m.get("keys", {})
@@ -160,7 +163,9 @@ class Map:
         return self.subprocess if f in self.eager else 0
 
     def import_impact(self, f, lines):
-        imp = self.import_lines.get(f)
+        """A change inside function bodies on these lines: the modules whose
+        import ran them may now build something else, or fail."""
+        imp = self.import_func_lines.get(f)
         if not imp:
             return 0
         m = 0
@@ -519,6 +524,7 @@ class Selector:
         self.files = {}
         self.touched = set()  # (file, line): old lines a change inside function bodies touches
         self.nonline = False  # a change that is not just lines inside functions
+        self.nonline_files = set()  # files with such a change
         try:
             diffs = parse_patch(patch_text)
         except Exception as e:  # noqa: BLE001
@@ -707,6 +713,7 @@ class Selector:
             return self.new_def_mask(f, old, path, idx, name)
         if kind == "class":
             self.nonline = True
+            self.nonline_files.add(f)
             _, path, idx = c
             cls = path[idx]
             cq = qualname(path, idx)
@@ -732,6 +739,7 @@ class Selector:
             return mask
         # module level
         self.nonline = True
+        self.nonline_files.add(f)
         stmts = overlapping(tree.tree.body, a, b)
         mask = 0
         for s in stmts:
@@ -759,6 +767,7 @@ class Selector:
         return m.line_users(f, lines) | m.import_impact(f, lines if import_lines is None else import_lines)
 
     def func_mask(self, f, old, q):
+        self.nonline_files.add(f)  # the def statement itself runs at import
         r = old.funcs().get(q)
         if r is None:
             return self.m.module_impact(f)
@@ -821,6 +830,7 @@ class Selector:
     def new_def_mask(self, f, old, path, idx, name):
         m = self.m
         self.nonline = True
+        self.nonline_files.add(f)
         # A def that did not exist: it may override a method for every user of
         # the enclosing class, or shadow a module-level name.
         for i in range(idx - 1, -1, -1):
@@ -1208,6 +1218,7 @@ def load_tpcds(tests):
         "data": {f: set(v) for f, v in t["data_lines"].items()},
         "queries": {f: {int(ln): int(h, 16) for ln, h in v.items()} for f, v in t["query_lines"].items()},
         "cost": {int(i): c for i, c in t.get("cost", {}).items()},
+        "worker": set(t.get("worker_modules", ())),
     }
 
 
@@ -1217,14 +1228,32 @@ def tpcds_queries(tp, sel, m, must, maybe):
     if tp is None:
         return None
     bit = 1 << tp["num"]
-    if not maybe & bit or must & bit or sel.nonline or not sel.touched:
+    if not maybe & bit or must & bit or not (sel.touched or sel.nonline_files):
         return None
+    worker = tp["worker"]
+    everything = (1 << (max(tp["baseline"]) + 1)) - 1
     affected = 0
+    for f in sel.nonline_files:
+        # A class, module or signature change. In a file the test's pool
+        # workers never load, it can only reach the test through the main
+        # process (the parsed trees and the DuckDB SQL), which the check
+        # recomputes for every query; in one they load, it may change what
+        # the data phase runs.
+        if f in worker or not f.startswith("sqlglot/"):
+            return None
+        affected = everything
     for f, ln in sel.touched:
-        if ln in tp["data"].get(f, ()):
+        if f.startswith("sqlglot/executor/") or ln in tp["data"].get(f, ()):
             return None  # code that runs while plans execute over data
-        if str(ln) in m.import_lines.get(f, {}):
-            return None  # runs at import: may change what the data phase uses
+        importers = m.import_func_lines.get(f, {}).get(str(ln))
+        if importers:
+            # Runs while modules import. Fine when none of them is loaded by a
+            # worker (DuckDB's generator parses its templates at import):
+            # only the main process sees the result, and it is recomputed.
+            if "?" in importers or not worker.isdisjoint(importers):
+                return None
+            affected = everything
+            continue
         q = tp["queries"].get(f, {}).get(ln, 0)
         if not q and m.line_users(f, [ln]) & bit:
             # The test runs this line, but not inside anything the check

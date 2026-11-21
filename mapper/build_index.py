@@ -257,6 +257,9 @@ def main():
     import_lines = defaultdict(dict)
     for f, ln, mods in imp["import_lines"]:
         import_lines[f][str(ln)] = mods
+    import_func_lines = defaultdict(dict)
+    for f, ln, mods in imp.get("import_func_lines", ()):
+        import_func_lines[f][str(ln)] = mods
 
     files, imports = static_imports(src_root)
     importers = defaultdict(set)
@@ -306,6 +309,7 @@ def main():
         "dirs": {p: ref(m) for p, m in sorted(dirs.items())},
         "subprocess": ref(subprocess_mask),
         "import_lines": import_lines,
+        "import_func_lines": import_func_lines,
         "importers": closure,
         "tracked": imp.get("tracked", []),
         "import_reads": _import_reads(imp.get("import_reads", [])),

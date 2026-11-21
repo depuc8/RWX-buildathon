@@ -111,6 +111,10 @@ class SyncPool:
 # ---------------------------------------------------------------- parent phase
 
 import_lines = defaultdict(set)  # (file, line) -> importing module files
+# The same, for lines run by function or lambda code (not module or class
+# bodies): a lambda in a class-level dict shares its first line with the dict
+# entry that creates it at import, but its body only runs when called.
+import_func_lines = defaultdict(set)
 import_receivers = set()  # (class, importing module file): a method ran on it while importing
 import_reads = set()  # (class, attr, key token or None, importing module): read while importing
 IMPORTING = True  # parent phase: attribute reads are recorded per importing module
@@ -130,7 +134,10 @@ def _p_line(code, line):
     r = rel(code.co_filename)
     if r is None:
         return DISABLE
-    import_lines[(r, line)].add(_importing_module(sys._getframe(1)))
+    mod = _importing_module(sys._getframe(1))
+    import_lines[(r, line)].add(mod)
+    if code.co_flags & 1:  # CO_OPTIMIZED: a function or lambda body
+        import_func_lines[(r, line)].add(mod)
     return DISABLE
 
 
@@ -822,6 +829,7 @@ def pytest_runtestloop(session):
         json.dump(
             {
                 "import_lines": sorted([f, ln, sorted(m)] for (f, ln), m in import_lines.items()),
+                "import_func_lines": sorted([f, ln, sorted(m)] for (f, ln), m in import_func_lines.items()),
                 "collect_opens": {p: sorted(v) for p, v in sorted(collect_opens.items())},
                 "tracked": tracked,
                 "sites": SITES,

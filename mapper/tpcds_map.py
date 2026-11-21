@@ -1,8 +1,9 @@
 """Build maps/tpcds.json.gz for tpcds_check: baseline fingerprints, the lines
 each query's plan phase runs, and the lines the data phase runs.
 
-    python mapper/tpcds_map.py /out/tpcds_data_lines.json /out/tpcds.json.gz
-(run from the sqlglot checkout, with the repo root on PYTHONPATH)
+    python mapper/tpcds_map.py /out/tpcds_worker.json /out/tpcds.json.gz
+(run from the sqlglot checkout, with the repo root on PYTHONPATH; the first
+file comes from mapper/tpcds_worker.py)
 """
 import gzip, json, os, sys
 sys.path.insert(0, os.getcwd())
@@ -81,12 +82,13 @@ for i in range(n):
     tpcds_check.fingerprints([i])
     cost[i] = round(_cpu() - t0, 4)
 
-data_lines = json.load(open(sys.argv[1]))
+worker = json.load(open(sys.argv[1]))
 out = {
     "test": tpcds_check.TEST_ID,
     "baseline": {str(i): sorted(v, key=str) for i, v in variants.items()},
     "query_lines": {f: {ln: format(m, "x") for ln, m in v.items()} for f, v in query_lines.items()},
-    "data_lines": data_lines,
+    "data_lines": worker["data_lines"],
+    "worker_modules": worker["worker_modules"],
     "cost": {str(i): c for i, c in cost.items()},
 }
 with gzip.open(sys.argv[2], "wb", compresslevel=9) as fh:

@@ -210,6 +210,16 @@ def start_tpcds(src, files, indices, baseline=None):
             sys.path.insert(0, SRC)
             sys.dont_write_bytecode = True
             sys.meta_path.insert(0, _Overlay(files))
+            # In the suite run, earlier tests have imported every module by
+            # the time this test runs: let patched ones have their import-time
+            # effects here too.
+            for path in sorted(files):
+                if path.startswith("sqlglot/") and path.endswith(".py"):
+                    name = path[:-3].replace("/", ".").removesuffix(".__init__")
+                    try:
+                        importlib.import_module(name)
+                    except Exception:  # noqa: BLE001
+                        pass
             import tpcds_check
 
             fp = tpcds_check.fingerprints(indices, baseline)

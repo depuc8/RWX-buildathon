@@ -33,6 +33,9 @@ OUT = os.environ.get("BRMAP_OUT", "/out/map")
 JOBS = int(os.environ.get("BRMAP_JOBS", "8"))
 TIMEOUT = int(os.environ.get("BRMAP_TIMEOUT", "1800"))
 ONLY = os.environ.get("BRMAP_ONLY")  # comma-separated test numbers, for debugging
+# BRMAP_CALIB=1: no tracing; record only the CPU each test costs when run cold
+# in a fresh process with in-process pools, as the selector's verifier runs it.
+CALIB = os.environ.get("BRMAP_CALIB") == "1"
 
 M = sys.monitoring
 TOOL = 2
@@ -105,6 +108,9 @@ class SyncPool:
 # ---------------------------------------------------------------- parent phase
 
 import_lines = defaultdict(set)  # (file, line) -> importing module files
+import_receivers = set()  # (class, importing module file): a method ran on it while importing
+import_reads = set()  # (class, attr, key token or None, importing module): read while importing
+IMPORTING = True  # parent phase: attribute reads are recorded per importing module
 collect_opens = defaultdict(set)  # opened path -> test files collecting it
 _parent_active = True
 
@@ -134,6 +140,49 @@ def _p_module_edge(code, *_):
     return DISABLE
 
 
+def _p_module_return(code, *_):
+    if code.co_name != "<module>":
+        return DISABLE
+    M.restart_events()
+    g = sys._getframe(1).f_globals
+    modname = g.get("__name__", "")
+    if modname == "sqlglot" or modname.startswith("sqlglot."):
+        # From here on, other modules' reads of this module's class
+        # attributes are recorded against whichever module is importing.
+        wrap_classes(g, modname)
+    return None
+
+
+_p_first_arg = {}
+
+
+def _p_start(code, _off):
+    if code.co_name == "<module>":
+        M.restart_events()
+        return None
+    name = _p_first_arg.get(code, 0)
+    if name == 0:
+        name = None
+        # Class creation hooks run on every class as it is defined; that is
+        # not the module using the class.
+        if (
+            rel(code.co_filename)
+            and code.co_argcount > 0
+            and code.co_varnames[0] in ("self", "cls")
+            and code.co_name not in ("__init_subclass__", "__set_name__", "__class_getitem__", "__new__")
+        ):
+            name = code.co_varnames[0]
+        _p_first_arg[code] = name
+    if name is None:
+        return DISABLE
+    frame = sys._getframe(1)
+    mod = _importing_module(frame)
+    if mod != "?":
+        v = frame.f_locals.get(name)
+        import_receivers.add((v if isinstance(v, type) else type(v), mod))
+    return None
+
+
 def _p_audit(event, args):
     if not _parent_active or event != "open":
         return
@@ -151,10 +200,12 @@ def _p_audit(event, args):
 
 
 def pytest_configure(config):
+    if CALIB:
+        return
     M.use_tool_id(TOOL, "brmap")
     M.register_callback(TOOL, M.events.LINE, _p_line)
-    M.register_callback(TOOL, M.events.PY_START, _p_module_edge)
-    M.register_callback(TOOL, M.events.PY_RETURN, _p_module_edge)
+    M.register_callback(TOOL, M.events.PY_START, _p_start)
+    M.register_callback(TOOL, M.events.PY_RETURN, _p_module_return)
     M.set_events(TOOL, M.events.LINE | M.events.PY_START | M.events.PY_RETURN)
     sys.addaudithook(_p_audit)
 
@@ -209,16 +260,46 @@ class Tracked:
 
     def __get__(self, obj, owner=None):
         rec = REC
-        if rec is not None and not rec.paused:
-            rec.attr_reads.add((owner if owner is not None else type(obj), self.name))
+        if rec is not None:
+            if not rec.paused:
+                rec.attr_reads.add((owner if owner is not None else type(obj), self.name))
+        elif IMPORTING:
+            frame = sys._getframe(1)
+            if not _in_class_body(frame):
+                mod = _importing_module(frame)
+                if mod != "?":
+                    import_reads.add((owner if owner is not None else type(obj), self.name, None, mod))
         return self.value
+
+
+_COMPREHENSIONS = ("<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>")
+
+
+def _in_class_body(frame):
+    """Is this read made by a class body (e.g. KEYWORDS = {**Base.KEYWORDS})?
+    Those are copies or derivations the static analysis already accounts for."""
+    if frame.f_code.co_name in _COMPREHENSIONS and frame.f_back is not None:
+        frame = frame.f_back
+    if frame.f_code.co_name == "<module>":
+        return False
+    loc = frame.f_locals
+    return "__qualname__" in loc and "__module__" in loc
 
 
 def _key_read(d, key):
     rec = REC
     owner = getattr(d, "_br_owner", None)
-    if rec is not None and not rec.paused and owner is not None:
-        rec.key_reads.add((owner, d._br_name, key))
+    if owner is None:
+        return
+    if rec is not None:
+        if not rec.paused:
+            rec.key_reads.add((owner, d._br_name, key))
+    elif IMPORTING:
+        frame = sys._getframe(2)
+        if not _in_class_body(frame):
+            mod = _importing_module(frame)
+            if mod != "?":
+                import_reads.add((owner, d._br_name, key, mod))
 
 
 class TDict(dict):
@@ -266,22 +347,23 @@ def _tdict(value, owner, name):
     return d
 
 
-def install_tracking():
-    import sqlglot.generator as generator_mod
+_wrapped = set()
 
-    seen = set()
 
-    def walk(cls, modname):
-        if not isinstance(cls, type) or cls in seen or cls.__module__ != modname:
+def wrap_classes(namespace, modname):
+    """Replace the data attributes of the classes defined in a module."""
+
+    def walk(cls):
+        if not isinstance(cls, type) or cls in _wrapped or cls.__module__ != modname:
             return
-        seen.add(cls)
+        _wrapped.add(cls)
         if isinstance(cls, enum.EnumMeta):
             return
         for name, v in list(cls.__dict__.items()):
             if name.startswith("__") or name.startswith("_abc"):
                 continue
             if isinstance(v, type):
-                walk(v, modname)
+                walk(v)
                 continue
             if callable(v) or hasattr(type(v), "__get__") or hasattr(type(v), "__set__"):
                 continue
@@ -289,10 +371,19 @@ def install_tracking():
                 v = _tdict(v, cls, name)
             type.__setattr__(cls, name, Tracked(v, name))
 
+    for obj in list(namespace.values()):
+        walk(obj)
+
+
+def install_tracking():
+    global IMPORTING
+    import sqlglot.generator as generator_mod
+
+    IMPORTING = False
     for modname, mod in list(sys.modules.items()):
         if modname == "sqlglot" or modname.startswith("sqlglot."):
-            for obj in list(vars(mod).values()):
-                walk(obj, modname)
+            wrap_classes(vars(mod), modname)
+    seen = _wrapped
 
     # The generator copies TRANSFORMS into a per-class dispatch table on first
     # use; keep tracking key lookups through that copy.
@@ -405,6 +496,20 @@ def pytest_runtest_logreport(report):
         REC.failed.append(f"{report.when}:{getattr(report, 'context', '')}")
 
 
+def _run_calib(item, number):
+    import resource
+    from _pytest.runner import runtestprotocol
+
+    r0 = resource.getrusage(resource.RUSAGE_SELF)
+    reports = runtestprotocol(item, nextitem=None, log=False)
+    r1 = resource.getrusage(resource.RUSAGE_SELF)
+    cpu = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
+    data = {"number": number, "id": item.nodeid, "cpu": round(cpu, 4),
+            "failed": [r.when for r in reports if r.failed]}
+    with open(f"{OUT}/tests/{number}.json", "w") as fh:
+        json.dump(data, fh)
+
+
 def _run_child(item, number):
     global REC
     from _pytest.runner import runtestprotocol
@@ -461,10 +566,13 @@ def pytest_runtestloop(session):
         return None
 
     _import_everything()
-    M.set_events(TOOL, 0)
-    M.free_tool_id(TOOL)
     _parent_active = False
-    tracked = install_tracking()
+    if CALIB:
+        tracked = []
+    else:
+        M.set_events(TOOL, 0)
+        M.free_tool_id(TOOL)
+        tracked = install_tracking()
 
     os.makedirs(f"{OUT}/tests", exist_ok=True)
     with open(f"{OUT}/import.json", "w") as fh:
@@ -473,6 +581,14 @@ def pytest_runtestloop(session):
                 "import_lines": sorted([f, ln, sorted(m)] for (f, ln), m in import_lines.items()),
                 "collect_opens": {p: sorted(v) for p, v in sorted(collect_opens.items())},
                 "tracked": tracked,
+                "import_reads": sorted(
+                    {(k, name, tok or "", mod) for cls, name, tok, mod in import_reads
+                     for b in getattr(cls, "__mro__", ()) if (k := class_key(b))}
+                ),
+                "import_receivers": sorted(
+                    {(k, mod) for cls, mod in import_receivers for b in getattr(cls, "__mro__", ())
+                     if (k := class_key(b))}
+                ),
             },
             fh,
         )
@@ -515,7 +631,7 @@ def pytest_runtestloop(session):
             if pid == 0:
                 code = 0
                 try:
-                    _run_child(item, n)
+                    (_run_calib if CALIB else _run_child)(item, n)
                 except BaseException as e:  # noqa: BLE001
                     print(f"brmap: child {n} crashed: {e!r}", file=sys.stderr)
                     code = 1

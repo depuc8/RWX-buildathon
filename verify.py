@@ -131,12 +131,52 @@ class _Collector:
             self.errors.add(report.nodeid)
 
 
+RUNNER = os.environ.get("BR_RUNNER", "pytest")
+
+
+def _run_unittest(nodeids):
+    """Every sqlglot test is a unittest.TestCase method, so plain unittest
+    gives pytest's outcome (subtest failures fail the test) for less start-up."""
+    import unittest
+
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    failed = set()
+    for nid in nodeids:
+        path, cls, meth = nid.split("::")
+        try:
+            suite.addTest(loader.loadTestsFromName(f"{path[:-3].replace('/', '.')}.{cls}.{meth}"))
+        except Exception:  # noqa: BLE001  (the test file no longer imports)
+            failed.add(nid)
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "ProcessPoolExecutor", None) is not None and (
+            getattr(mod, "__name__", "").startswith("tests.")
+        ):
+            mod.ProcessPoolExecutor = SyncPool
+    result = unittest.TestResult()
+    suite.run(result)
+    by_id = {}
+    for nid in nodeids:
+        path, cls, meth = nid.split("::")
+        by_id[f"{path[:-3].replace('/', '.')}.{cls}.{meth}"] = nid
+    for test, _ in result.failures + result.errors + [(t, None) for t in result.unexpectedSuccesses]:
+        case = getattr(test, "test_case", test)  # a failing subtest fails its test
+        nid = by_id.get(case.id()) if hasattr(case, "id") else None
+        if nid is None:
+            return set(nodeids)  # class or module setup failed: count them all
+        failed.add(nid)
+    return failed
+
+
 def _child(files, nodeids, wfd):
     os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
     os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
     os.chdir(SRC)
     sys.path.insert(0, SRC)
     sys.meta_path.insert(0, _Overlay(files))
+    if RUNNER == "unittest":
+        os.write(wfd, json.dumps(sorted(_run_unittest(nodeids))).encode())
+        os._exit(0)
     import pytest
 
     col = _Collector()
@@ -179,7 +219,8 @@ def poll(handle, timeout):
         chunk = os.read(fd, 65536)
         if not chunk:
             os.close(fd)
-            os.waitpid(handle["pid"], 0)
+            _, _, ru = os.wait4(handle["pid"], 0)
+            handle["cpu"] = ru.ru_utime + ru.ru_stime
             try:
                 return set(json.loads(handle["buf"].decode()))
             except ValueError:
@@ -191,6 +232,7 @@ def poll(handle, timeout):
         except ProcessLookupError:
             pass
         os.close(fd)
-        os.waitpid(handle["pid"], 0)
+        _, _, ru = os.wait4(handle["pid"], 0)
+        handle["cpu"] = ru.ru_utime + ru.ru_stime
         return set(handle["nodeids"])
     return None

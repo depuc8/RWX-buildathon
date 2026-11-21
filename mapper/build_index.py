@@ -158,6 +158,28 @@ def derived_names(src_root):
     return names
 
 
+def _import_reads(rows):
+    """class key -> attr -> key token ("" = the attribute itself, "*" = all
+    of it) -> modules that read it while being imported."""
+    out = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+    keyed = defaultdict(set)  # (class, attr) -> modules that looked up keys
+    for k, name, tok, mod in rows:
+        if tok:
+            keyed[(k, name)].add(mod)
+    for k, name, tok, mod in rows:
+        out[k][name][tok].add(mod)
+        if not tok and mod not in keyed[(k, name)]:
+            out[k][name]["*"].add(mod)
+    return {k: {n: {t: sorted(m) for t, m in v.items()} for n, v in a.items()} for k, a in out.items()}
+
+
+def _group(pairs):
+    out = defaultdict(set)
+    for k, mod in pairs:
+        out[k].add(mod)
+    return out
+
+
 def main():
     map_dir, src_root, tests_json, out_path = sys.argv[1:5]
     tests = json.load(open(tests_json))["tests"]
@@ -273,6 +295,10 @@ def main():
         "import_lines": import_lines,
         "importers": closure,
         "tracked": imp.get("tracked", []),
+        "import_reads": _import_reads(imp.get("import_reads", [])),
+        "import_users": {
+            k: sorted(v) for k, v in sorted(_group(imp.get("import_receivers", [])).items())
+        },
         "attrs": {c: {n: ref(m) for n, m in sorted(v.items())} for c, v in sorted(attr_users.items())},
         "keys": {
             c: {n: {t: ref(m) for t, m in sorted(toks.items())} for n, toks in sorted(v.items())}

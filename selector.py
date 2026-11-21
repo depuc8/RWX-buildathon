@@ -63,6 +63,8 @@ class Map:
         self.derived = set(m.get("derived", ()))
         self.tracked = set(m.get("tracked", ()))
         self.eager = set(m.get("eager", ()))
+        self.import_users = m.get("import_users", {})
+        self.import_reads = m.get("import_reads", {})
         self.n_tests = n_tests
         self.all = (1 << n_tests) - 1
         self._module_users = {}
@@ -119,6 +121,30 @@ class Map:
         m = self.module_users(f) | self.eager_tests(f)
         for g in self.importers.get(f, ()):
             m |= self.module_users(g)
+        return m
+
+    def import_read(self, ckey, name, toks=None):
+        """Modules that read this class attribute (or these keys of it) while
+        being imported: the change can make their import fail, or change what
+        they built from it."""
+        reads = self.import_reads.get(ckey, {}).get(name)
+        if not reads:
+            return 0
+        mods = set()
+        for t in ([""] if toks is None else ["*", *toks]):
+            mods.update(reads.get(t, ()))
+        if toks is None:
+            for v in reads.values():
+                mods.update(v)
+        m = 0
+        for mod in mods:
+            m |= self.module_impact(mod)
+        return m
+
+    def import_read_any(self, ckey):
+        m = 0
+        for name in self.import_reads.get(ckey, {}):
+            m |= self.import_read(ckey, name)
         return m
 
     def eager_tests(self, f):
@@ -657,7 +683,7 @@ class Selector:
 
     def class_mask(self, f, cq):
         m = self.m
-        return m.class_users(f, cq) | m.eager_tests(f)
+        return m.class_users(f, cq) | m.eager_tests(f) | m.import_read_any(f"{f}::{cq}")
 
     def attr_mask(self, f, cq, s, a, b):
         """A class-body statement: if it just sets data attributes, only the
@@ -665,13 +691,21 @@ class Selector:
         m = self.m
         ckey = f"{f}::{cq}"
         names = assigned_names(s)
-        if not names or ckey not in m.tracked or names & m.derived:
+        if not names or ckey not in m.tracked:
             return self.class_mask(f, cq)
+        if names & m.derived:
+            # Built into something else when classes are created: every user
+            # of the class, and modules that read it while importing.
+            mask = m.class_users(f, cq) | m.eager_tests(f)
+            for n in names:
+                mask |= m.import_read(ckey, n)
+            return mask
         toks = None
         if len(names) == 1 and isinstance(getattr(s, "value", None), ast.Dict):
             toks = dict_entry_tokens(s.value, a, b)
         mask = m.eager_tests(f)
         for n in names:
+            mask |= m.import_read(ckey, n, toks)
             if toks is None:
                 mask |= m.attr_users(ckey, n)
             else:
@@ -931,6 +965,10 @@ def split(numbers, ms):
 
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", 1500))  # never run these here
 VERIFY_MAX_MS = int(os.environ.get("BR_VERIFY_MAX_MS", 4000))
+# With no heavy candidate to drop, a verification can only save a worker or
+# two: worth it only when the cheap tests are nearly free to run.
+VERIFY_LIGHT_MAX_MS = int(os.environ.get("BR_VERIFY_LIGHT_MAX_MS", 400))
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", 2.5))  # CPU per recorded second, run here
 OVERHEAD_MS = int(os.environ.get("BR_OVERHEAD_MS", 500))  # per verification
 # Drop the heavy candidates when every cheap test reaching the same code passes.
 BET = os.environ.get("BR_BET", "1") == "1"
@@ -970,8 +1008,9 @@ def main():
             sum_l = sum(ms[i] for i in numbers_of(light, n))
             listed = cost_of(split(numbers_of(must | maybe, n), ms), ms)
             keep = must if BET else must | hv
-            best = OVERHEAD_MS + sum_l + cost_of(split(numbers_of(keep, n), ms), ms)
-            if sum_l <= VERIFY_MAX_MS and best < listed:
+            best = OVERHEAD_MS + CPU_FACTOR * sum_l + cost_of(split(numbers_of(keep, n), ms), ms)
+            limit = VERIFY_MAX_MS if (hv and BET) else VERIFY_LIGHT_MAX_MS
+            if sum_l <= limit and best < listed:
                 plan["verify"] = True
                 plan["sum_l"] = sum_l
         plans.append(plan)
@@ -983,7 +1022,7 @@ def main():
         for p in todo:
             failing = set(answers.get(p["commit"], {}).get("failing", ()))
             p["failed"] = sum(1 << i for i in numbers_of(p["light"], n) if i in failing)
-            est_cpu += OVERHEAD_MS + p["sum_l"]
+            est_cpu += OVERHEAD_MS + CPU_FACTOR * p["sum_l"]
     elif todo:
         sys.path.insert(0, str(HERE))  # python -I leaves the script's folder off the path
         import verify
@@ -1005,6 +1044,7 @@ def main():
                 else:
                     num = {v: k for k, v in ids.items()}
                     p["failed"] = sum(1 << num[x] for x in failed if x in num)
+                    p["cpu"] = h.get("cpu", 0)
             running = still
             if running:
                 time.sleep(0.01)
@@ -1015,7 +1055,8 @@ def main():
             failed = p["failed"]
             keep_heavy = p["heavy"] if (failed or not BET) else 0
             mask = p["must"] | failed | keep_heavy
-            log(f"{p['commit']}: verified {bin(p['light']).count('1')} cheap tests, "
+            log(f"{p['commit']}: verified {bin(p['light']).count('1')} cheap tests "
+                f"({p['sum_l'] / 1000:.1f} s recorded, {p.get('cpu', 0):.2f} s CPU), "
                 f"{bin(failed).count('1')} failed; heavy {'kept' if keep_heavy else 'dropped'}")
         else:
             mask = p["must"] | p["light"] | p["heavy"]

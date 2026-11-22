@@ -300,7 +300,7 @@ def start_import_check(src, files, deleted, test_files):
     return {"pid": pid, "fd": r, "buf": b"", "t0": time.monotonic()}
 
 
-def start_tpcds(src, files, indices, baseline=None, deleted=()):
+def start_tpcds(src, files, indices, baseline=None, deleted=(), attrs=None):
     """Fork a child that fingerprints these TPC-DS queries on the patched files
     (see tpcds_check). Returns a handle for poll_json."""
     global SRC
@@ -328,6 +328,14 @@ def start_tpcds(src, files, indices, baseline=None, deleted=()):
                         pass
             import tpcds_check
 
+            if attrs is not None:
+                # Class attributes the data phase reads must be as they were.
+                data_attrs, attr_baseline = attrs
+                import sqlglot.executor.python  # noqa: F401  (loads what a worker loads)
+
+                if tpcds_check.attr_fingerprints(data_attrs) != attr_baseline:
+                    os.write(w, json.dumps({}).encode())  # nothing matches: differs
+                    os._exit(0)
             fp = tpcds_check.fingerprints(indices, baseline)
             os.write(w, json.dumps({str(k): v for k, v in fp.items()}).encode())
         except BaseException:  # noqa: BLE001

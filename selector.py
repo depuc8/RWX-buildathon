@@ -198,6 +198,37 @@ class Map:
 
 TESTS_BY_FILE = {}
 
+# TestExecutor's setUpClass parses these SQL fixtures; the tests that use
+# the pairs, and which part of each pair (see tests/test_executor.py at the
+# pinned commit). Every other TestExecutor test only needs them to parse.
+EXECUTOR_FIXTURES = {
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": {
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds": "inputs",
+    },
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": {
+        "tests/test_executor.py::TestExecutor::test_execute_tpch": "inputs",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch": "all",
+    },
+}
+EXECUTOR = {}  # TestExecutor test id -> number
+
+
+def sql_fixture_pairs(text):
+    """tests/helpers.py's load_sql_fixture_pairs, on a text."""
+    s = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")])
+    statements = s.split(";")
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql = statements[i].strip()
+            meta = {}
+            sql_lines = sql.split("\n")
+            j = 0
+            while sql_lines[j].startswith("#"):
+                key, val = sql_lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            yield meta, "\n".join(sql_lines[j:]), statements[i + 1].strip()
+
 
 # ----------------------------------------------------------------- the patch
 
@@ -550,8 +581,12 @@ class Selector:
         self.files = {}
         self.deleted = set()  # Python files the patch deletes or renames away
         self.touched = set()  # (file, line): old lines a change inside function bodies touches
-        self.nonline = False  # a change that is not just lines inside functions
-        self.nonline_files = set()  # files with such a change
+        # Changes that are not just lines inside function bodies, by file:
+        # "class" (class data attributes), "module" (module-level imports and
+        # assignments), "def" (an existing def's header or decorators) and
+        # "newdef" (defs or classes added, removed or reshaped).
+        self.nonline = {}
+        self.module_names = {}  # file -> names its module-level changes bind (None: unknown)
         try:
             diffs = parse_patch(patch_text)
         except Exception as e:  # noqa: BLE001
@@ -582,7 +617,7 @@ class Selector:
         for p in paths:
             i = m.opens.get(p)
             if i is not None:
-                self.must |= m.bits(i)
+                self.must |= self.fixture_readers(d, p, m.bits(i))
             for tf in m.collect_opens.get(p, ()):
                 self.must |= m.all if tf == "?" else TESTS_BY_FILE.get(tf, 0)
         if d.old != d.new or d.old is None or d.new is None:
@@ -653,6 +688,26 @@ class Selector:
         for g in groups:
             mask |= self.group_mask(f, old, new, old_lines, new_lines, g)
         return mask
+
+    def fixture_readers(self, d, p, readers):
+        """Readers of a changed file, less the executor tests that cannot see
+        this change (see EXECUTOR_FIXTURES)."""
+        uses = EXECUTOR_FIXTURES.get(p)
+        if uses is None or d.old != d.new or d.binary:
+            return readers
+        try:
+            old = list(sql_fixture_pairs(self.old_text(p)))
+            new = list(sql_fixture_pairs("\n".join(apply_hunks(self.old_text(p).split("\n"), d.hunks)[0])))
+        except Exception:  # noqa: BLE001  (setUpClass would fail too)
+            return readers
+        same_inputs = [x[:2] for x in old] == [x[:2] for x in new]
+        same_all = old == new
+        for test, num in EXECUTOR.items():
+            part = uses.get(test)
+            if part is None or same_all or (same_inputs and part == "inputs"):
+                readers &= ~(1 << num)
+        log(f"  {p}: {'unchanged pairs' if same_all else 'unchanged inputs' if same_inputs else 'inputs changed'}")
+        return readers
 
     def group_mask(self, f, old, new, old_lines, new_lines, group):
         m = self.m
@@ -758,8 +813,6 @@ class Selector:
                 return self.func_mask(f, old, q)
             return self.new_def_mask(f, old, path, idx, name)
         if kind == "class":
-            self.nonline = True
-            self.nonline_files.add(f)
             _, path, idx = c
             cls = path[idx]
             cq = qualname(path, idx)
@@ -771,23 +824,26 @@ class Selector:
                     if side == "old" or sq in old.funcs():
                         mask |= self.func_mask(f, old, sq)
                     else:
+                        self.mark(f, "newdef")
                         mask |= m.class_users(f, cq)
                 elif isinstance(s, ast.ClassDef):
+                    self.mark(f, "newdef")
                     mask |= m.class_users(f, f"{cq}.{s.name}") | m.class_users(f, cq)
                 elif may_raise(path, s):
                     # Class bodies run at import: if this one now raises, the
                     # whole module fails to import.
+                    self.mark(f, "class")
                     mask |= m.module_impact(f) | self.attr_mask(f, cq, s, a, b)
                 elif is_bare_string(s):
                     pass  # a docstring
                 else:
+                    self.mark(f, "class")
                     mask |= self.attr_mask(f, cq, s, a, b)
             if not stmts and side == "new":
+                self.mark(f, "newdef")
                 mask |= self.class_mask(f, cq)
             return mask
         # module level
-        self.nonline = True
-        self.nonline_files.add(f)
         stmts = overlapping(tree.tree.body, a, b)
         mask = 0
         for s in stmts:
@@ -795,21 +851,28 @@ class Selector:
                 if side == "old" or s.name in old.funcs():
                     mask |= self.func_mask(f, old, s.name)
                 elif s.name in old.toplevel_names():
+                    self.mark(f, "newdef")
                     mask |= m.module_impact(f) | self.name_mask(f, {s.name}, side, s)
             elif isinstance(s, ast.ClassDef):
+                self.mark(f, "newdef")
                 if side == "old" or s.name in old.toplevel_names():
                     mask |= m.class_users(f, s.name) | m.eager_tests(f)
             elif is_bare_string(s):
                 pass  # a docstring
-            elif m.light and (names := bound_names(s)) is not None:
-                # An import or a plain assignment: what can see it is code that
-                # names what it binds (here or anywhere else), and whatever
-                # was built from those names while modules imported.
-                m.light_used = True
-                mask |= self.name_mask(f, names, side, s) | m.eager_tests(f)
             else:
-                mask |= m.module_impact_full(f)
+                names = bound_names(s)
+                self.mark(f, "module", names)
+                if m.light and names is not None:
+                    # An import or a plain assignment: what can see it is code
+                    # that names what it binds (here or anywhere else), and
+                    # whatever was built from those names while modules imported.
+                    m.light_used = True
+                    mask |= self.name_mask(f, names, side, s) | m.eager_tests(f)
+                else:
+                    mask |= m.module_impact_full(f)
             if side == "old" and a <= start(s) and end(s) <= b and not is_bare_string(s):
+                if isinstance(s, FUNCS + (ast.ClassDef,)):
+                    self.mark(f, "newdef")
                 # A whole top-level statement went away: importers of what it
                 # bound break at import time (which the import check rules
                 # out in light mode), and code using it breaks when it runs.
@@ -820,8 +883,20 @@ class Selector:
                 elif bound_names(s) is None:
                     mask |= m.module_impact_full(f)
         if not stmts and side == "new":
+            self.mark(f, "module", None)
             mask |= m.module_impact_full(f)
         return mask
+
+    def mark(self, f, kind, names=()):
+        """Record a change that is not just lines in function bodies (see
+        select); for "module", the names it binds or None. Returns True."""
+        self.nonline.setdefault(f, set()).add(kind)
+        if kind == "module":
+            if names is None or self.module_names.get(f, set()) is None:
+                self.module_names[f] = None
+            else:
+                self.module_names.setdefault(f, set()).update(names)
+        return True
 
     def name_mask(self, f, names, side, stmt):
         """Tests that run a line using any of `names` from module f: in f
@@ -850,7 +925,7 @@ class Selector:
         return m.line_users(f, lines) | m.import_impact(f, lines if import_lines is None else import_lines)
 
     def func_mask(self, f, old, q):
-        self.nonline_files.add(f)  # the def statement itself runs at import
+        self.mark(f, "def")  # the def statement itself runs at import
         r = old.funcs().get(q)
         if r is None:
             return self.m.module_impact_full(f)
@@ -912,8 +987,7 @@ class Selector:
 
     def new_def_mask(self, f, old, path, idx, name):
         m = self.m
-        self.nonline = True
-        self.nonline_files.add(f)
+        self.mark(f, "newdef")
         # A def that did not exist: it may override a method for every user of
         # the enclosing class, or shadow a module-level name.
         for i in range(idx - 1, -1, -1):
@@ -1542,29 +1616,56 @@ def load_tpcds(tests):
         "queries": {f: {int(ln): int(h, 16) for ln, h in v.items()} for f, v in t["query_lines"].items()},
         "cost": {int(i): c for i, c in t.get("cost", {}).items()},
         "worker": set(t.get("worker_modules", ())),
+        "data_attrs": t.get("data_attrs"),
+        "attr_baseline": t.get("attr_baseline"),
     }
 
 
 def tpcds_queries(tp, sel, m, must, maybe):
     """The TPC-DS queries whose plan-phase output must be recomputed to rule
-    out test_execute_tpcds, or None when the check cannot decide it."""
+    out test_execute_tpcds, and whether the class attributes the data phase
+    reads must be compared too; None when the check cannot decide it."""
     if tp is None:
         return None
     bit = 1 << tp["num"]
-    if not maybe & bit or must & bit or not (sel.touched or sel.nonline_files):
+    if not maybe & bit or must & bit or not (sel.touched or sel.nonline):
         return None
     worker = tp["worker"]
+    data = tp["data"]
     everything = (1 << (max(tp["baseline"]) + 1)) - 1
     affected = 0
-    for f in sel.nonline_files:
-        # A class, module or signature change. In a file the test's pool
-        # workers never load, it can only reach the test through the main
-        # process (the parsed trees and the DuckDB SQL), which the check
-        # recomputes for every query; in one they load, it may change what
-        # the data phase runs.
-        if f in worker or not f.startswith("sqlglot/"):
+    attrs = False
+    for f, kinds in sel.nonline.items():
+        # A change that is not just lines in function bodies. In a file the
+        # test's pool workers never load, it can only reach the test through
+        # the main process (the parsed trees and the DuckDB SQL), which the
+        # check recomputes for every query.
+        if not f.startswith("sqlglot/"):
             return None
         affected = everything
+        if f not in worker:
+            continue
+        # In a module the workers load, it may also change what the data
+        # phase runs. Class data attributes: the check compares every one the
+        # data phase reads with its value at the pinned commit (derived ones
+        # included). A def's header or decorators: the lines below cover its
+        # body. Module-level names: no line using them may run in the data
+        # phase or while a worker module imports. Defs and classes added,
+        # removed or reshaped can change methods the data phase calls.
+        if "newdef" in kinds:
+            return None
+        attrs = attrs or bool(kinds & {"class", "def"})
+        if "module" in kinds:
+            names = sel.module_names.get(f)
+            if names is None:
+                return None
+            for g, uses in name_references(f, names).items():
+                for ln, at_import in uses.items():
+                    if g.startswith("sqlglot/executor/") or ln in data.get(g, ()):
+                        return None
+                    importers = (m.import_lines if at_import else m.import_func_lines).get(g, {}).get(str(ln), ())
+                    if "?" in importers or not worker.isdisjoint(importers):
+                        return None
     for f, ln in sel.touched:
         if f.startswith("sqlglot/executor/") or ln in tp["data"].get(f, ()):
             return None  # code that runs while plans execute over data
@@ -1587,7 +1688,7 @@ def tpcds_queries(tp, sel, m, must, maybe):
     if not affected:
         return None
     # Cheapest first: one differing query decides, and is usually found early.
-    return sorted(numbers_of(affected, max(tp["baseline"]) + 1), key=lambda i: tp["cost"].get(i, 0))
+    return sorted(numbers_of(affected, max(tp["baseline"]) + 1), key=lambda i: tp["cost"].get(i, 0)), attrs
 
 
 def run_import_checks(plans):
@@ -1647,8 +1748,9 @@ def run_tpcds_checks(tp, plans):
     while queue or running:
         while queue and len(running) < PARALLEL:
             p = queue.pop(0)
+            attrs = (tp["data_attrs"], tp["attr_baseline"]) if p["tpcds_attrs"] else None
             running.append((p, verify.start_tpcds(SRC, p["files"], p["tpcds"],
-                                                  {i: tp["baseline"][i] for i in p["tpcds"]}, p["deleted"])))
+                                                  {i: tp["baseline"][i] for i in p["tpcds"]}, p["deleted"], attrs)))
         still = []
         for p, h in running:
             # A check runs about as long as its queries did at the pinned
@@ -1665,7 +1767,8 @@ def run_tpcds_checks(tp, plans):
             if same:
                 p["heavy"] &= ~(1 << tp["num"])
                 p["light"] &= ~(1 << tp["num"])
-            log(f"{p['commit']}: TPC-DS check over {len(p['tpcds'])} queries: "
+            log(f"{p['commit']}: TPC-DS check over {len(p['tpcds'])} queries"
+                f"{' and data-phase attributes' if p['tpcds_attrs'] else ''}: "
                 f"{'identical, test_execute_tpcds dropped' if same else 'differs, kept'} "
                 f"({h.get('cpu', 0):.2f} s CPU)")
         running = still
@@ -1688,6 +1791,8 @@ def main():
     ids = {t["number"]: t["id"] for t in tests}
     for t in tests:
         TESTS_BY_FILE[t["file"]] = TESTS_BY_FILE.get(t["file"], 0) | (1 << t["number"])
+        if t["id"].startswith("tests/test_executor.py::TestExecutor::"):
+            EXECUTOR[t["id"]] = t["number"]
     heavy = sum(1 << t["number"] for t in tests if ms[t["number"]] >= HEAVY_MS)
     m = Map(MAP, n)
     sel = Selector(tests, m)
@@ -1714,7 +1819,10 @@ def main():
             else:
                 plan["must"], plan["maybe"] = fmust, fmaybe
             must, maybe = fmust, fmaybe
-        plan["tpcds"] = tpcds_queries(tp, sel, m, must, maybe)
+        tq = tpcds_queries(tp, sel, m, must, maybe)
+        if tq and tq[1] and not tp["data_attrs"]:
+            tq = None  # no attribute baselines to compare with
+        plan["tpcds"], plan["tpcds_attrs"] = tq or (None, False)
         plans.append(plan)
 
     run_import_checks(plans)

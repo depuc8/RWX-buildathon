@@ -1,9 +1,9 @@
 """Build maps/tpcds.json.gz for tpcds_check: baseline fingerprints, the lines
 each query's plan phase runs, and the lines the data phase runs.
 
-    python mapper/tpcds_map.py /out/tpcds_worker.json /out/tpcds.json.gz
+    python mapper/tpcds_map.py /out/tpcds_worker.json /out/tpcds.json.gz /out/tpcds_attrs.json
 (run from the sqlglot checkout, with the repo root on PYTHONPATH; the first
-file comes from mapper/tpcds_worker.py)
+and last files come from mapper/tpcds_worker.py, the last run with TPW_ALL=1)
 """
 import gzip, json, os, sys
 sys.path.insert(0, os.getcwd())
@@ -83,12 +83,17 @@ for i in range(n):
     cost[i] = round(_cpu() - t0, 4)
 
 worker = json.load(open(sys.argv[1]))
+data_attrs = json.load(open(sys.argv[3]))["data_attrs"]
 out = {
     "test": tpcds_check.TEST_ID,
     "baseline": {str(i): sorted(v, key=str) for i, v in variants.items()},
     "query_lines": {f: {ln: format(m, "x") for ln, m in v.items()} for f, v in query_lines.items()},
     "data_lines": worker["data_lines"],
     "worker_modules": worker["worker_modules"],
+    # Class attributes the data phase reads, and their values at the pinned
+    # commit: a class-level change must leave all of them as they were.
+    "data_attrs": data_attrs,
+    "attr_baseline": tpcds_check.attr_fingerprints(data_attrs),
     "cost": {str(i): c for i, c in cost.items()},
 }
 with gzip.open(sys.argv[2], "wb", compresslevel=9) as fh:

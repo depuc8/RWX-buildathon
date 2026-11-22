@@ -5,9 +5,10 @@ sqlglot optimizes and plans it and the Python executor runs the plan over the
 data; the result is compared with DuckDB running the query transpiled to
 DuckDB SQL. Its outcome is therefore fixed by
 
-  (a) what sqlglot produces before running a plan, per query: the tree the
-      worker receives, the plan with every step's fields, the tables handed
-      to the executor, and the DuckDB SQL;
+  (a) what sqlglot produces before running a plan, per query: the plan the
+      worker builds from the tree it receives (with every step's fields),
+      the tables handed to the executor, and the DuckDB SQL; and that the
+      tree parses and pickles;
   (b) the code that runs plans over data (generating Python for each step,
       the row loops, env functions, tables), and the data itself.
 
@@ -71,6 +72,71 @@ def _step(step):
     }
 
 
+def _value_key(v, depth=0):
+    """A stable description of a class attribute's value, or None when it has
+    no stable form (then it counts as changed)."""
+    import enum
+    import types
+
+    if depth > 8:
+        return None
+    if v is None or isinstance(v, (bool, int, float, str, bytes)):
+        return [type(v).__name__, repr(v)]
+    if isinstance(v, enum.Enum):
+        return ["enum", type(v).__qualname__, v.name]
+    if isinstance(v, type):
+        return ["type", v.__module__, v.__qualname__]
+    if isinstance(v, (types.FunctionType, types.MethodType)):
+        f = getattr(v, "__func__", v)
+        return ["func", f.__module__, f.__qualname__, _code_key(f.__code__),
+                _value_key(f.__defaults__, depth + 1), _value_key(getattr(f, "__wrapped__", None), depth + 1)]
+    if isinstance(v, (types.BuiltinFunctionType, types.BuiltinMethodType)):
+        return ["builtin", getattr(v, "__module__", None), v.__qualname__]
+    if isinstance(v, (list, tuple)):
+        items = [_value_key(x, depth + 1) for x in v]
+        return None if None in items else [type(v).__name__, items]
+    if isinstance(v, (set, frozenset)):
+        items = [_value_key(x, depth + 1) for x in v]
+        return None if None in items else [type(v).__name__, sorted(items, key=_jkey)]
+    if isinstance(v, dict):
+        items = [[_value_key(k, depth + 1), _value_key(x, depth + 1)] for k, x in v.items()]
+        return None if any(None in kv for kv in items) else [type(v).__name__, items]
+    r = repr(v)
+    return None if " at 0x" in r or " object at " in r else ["repr", type(v).__qualname__, r]
+
+
+def _code_key(code):
+    consts = [_code_key(c) if hasattr(c, "co_code") else repr(c) for c in code.co_consts]
+    return hashlib.sha256(_jkey([code.co_code.hex(), consts, code.co_names, code.co_varnames]).encode()).hexdigest()
+
+
+def attr_fingerprints(data_attrs):
+    """{"file::Class": {name: hash or None}} of the class attributes the data
+    phase reads (maps/tpcds.json.gz), as they are after importing."""
+    import importlib
+
+    out = {}
+    for ckey, names in data_attrs.items():
+        path, qual = ckey.split("::")
+        mod = path[:-3].replace("/", ".").removesuffix(".__init__")
+        try:
+            obj = importlib.import_module(mod)
+            for part in qual.split("."):
+                obj = getattr(obj, part)
+        except Exception:  # noqa: BLE001
+            out[ckey] = None
+            continue
+        row = {}
+        for name in names:
+            try:
+                key = _value_key(getattr(obj, name))
+            except Exception:  # noqa: BLE001
+                key = None
+            row[name] = None if key is None else hashlib.sha256(_jkey(key).encode()).hexdigest()[:16]
+        out[ckey] = row
+    return out
+
+
 def fingerprints(indices=None, baseline=None):
     """{query index: fingerprint of everything the test derives from it
     before running a plan}. A query whose fingerprinting raises gets None.
@@ -106,7 +172,9 @@ def fingerprints(indices=None, baseline=None):
                     # shape can even vary with the hash seed).
                     out[i] = "parsed"
                     continue
-                parts = [_canon(expr)]
+                # The worker only plans the tree (find_tables included), so
+                # the plan stands for it.
+                parts = []
                 if meta.get("execute"):
                     captured.clear()
                     try:

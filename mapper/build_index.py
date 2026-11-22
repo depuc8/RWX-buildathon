@@ -249,8 +249,9 @@ def main():
             for c in mro.get(k, [k]):
                 attr_users[c][name] |= b
                 if name not in keyed:
-                    # Read but never looked up by key: count it as using all of it.
-                    key_users[c][name]["*"] |= b
+                    # Read but never used through the dict's (tracked) methods:
+                    # it held a reference, which a changed value alone cannot reach.
+                    key_users[c][name]["#ref"] |= b
     print(f"{seen}/{n_tests} tests mapped", file=sys.stderr)
 
     imp = json.load(open(os.path.join(map_dir, "import.json")))

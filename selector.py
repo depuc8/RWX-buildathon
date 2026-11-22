@@ -977,7 +977,7 @@ class Selector:
                 # whole. Keys came or went: also key iteration and size.
                 reads = {"*", *toks}
                 if not self.same_keys(cq, next(iter(names))):
-                    reads |= {"#keys", "#len"}
+                    reads |= {"#keys", "#len", "#ref"}
         if names & m.derived:
             if m.light:
                 # What was built from it when classes were created: the import
@@ -1467,7 +1467,7 @@ def diff_users(m, diff, patched):
             if vals is None:
                 mask |= m.attr_users(owner, name)
             else:
-                mask |= key_mask(m, owner, name, {"*", *vals} | ({"#keys", "#len", *keys} if keys else set()))
+                mask |= key_mask(m, owner, name, {"*", *vals} | ({"#keys", "#len", "#ref", *keys} if keys else set()))
         else:
             for g, uses in name_references(owner, {name}).items():
                 mask |= m.line_users(g, uses)

@@ -313,8 +313,13 @@ def _expression_eq():
     return _EXPR_EQ[0]
 
 
+def _plain_tuple(x):
+    """A tuple of plain values, like a dialect version (23, 12)."""
+    return type(x) is tuple and all(type(e) in _PLAIN for e in x)
+
+
 def _safe_eq(a, b):
-    if isinstance(a, _PLAIN) and isinstance(b, _PLAIN):
+    if (isinstance(a, _PLAIN) and isinstance(b, _PLAIN)) or (_plain_tuple(a) and _plain_tuple(b)):
         return a == b
     ea, eb = type(a).__eq__, type(b).__eq__
     if ea is object.__eq__ and eb is object.__eq__:
@@ -366,9 +371,13 @@ def _br_cmp(sid, op, a, b):
     if rec is not None:
         num = (isinstance(a, (int, float)) and isinstance(b, (int, float))) or (
             isinstance(a, (str, bytes)) and type(a) is type(b)
-        )
-        lt = (a < b) if num else None
-        gt = (a > b) if num else None
+        ) or (_plain_tuple(a) and _plain_tuple(b))
+        lt = gt = None
+        if num:
+            try:
+                lt, gt = a < b, a > b
+            except TypeError:  # (1, None) < (1, 2)
+                pass
         eq = r if op == "Eq" else (not r if op == "NotEq" else _safe_eq(a, b))
         ins = r if op == "In" else (not r if op == "NotIn" else None)
         # r: result as bool (or ? if not a bool); e/l/g: equal/less/greater;
@@ -485,6 +494,8 @@ def install_conditions():
 # class-level change to one setting then reaches only the tests that read it.
 
 WHOLE = "*"
+KEYS_ONLY = "#keys"
+SIZE = "#len"
 
 
 def _ktok(key):
@@ -572,20 +583,26 @@ class TDict(dict):
         return dict.pop(self, k, *default)
 
 
-def _whole(name):
+def _whole(name, token=None):
     base = getattr(dict, name)
+    token = token or WHOLE
 
     def method(self, *args, **kwargs):
-        _key_read(self, WHOLE)
+        _key_read(self, token)
         return base(self, *args, **kwargs)
 
     method.__name__ = name
     return method
 
 
-for _name in ("__iter__", "keys", "values", "items", "__len__", "copy", "__or__", "__ror__",
-              "__eq__", "__ne__", "__reversed__", "popitem", "__reduce_ex__"):
+# Reads that see the values (WHOLE), only the keys (KEYS_ONLY) or only the
+# size (SIZE, which bool() uses too): a change to a value alone reaches the
+# first kind only.
+for _name in ("values", "items", "copy", "__or__", "__ror__", "__eq__", "__ne__", "popitem", "__reduce_ex__"):
     setattr(TDict, _name, _whole(_name))
+for _name in ("__iter__", "keys", "__reversed__"):
+    setattr(TDict, _name, _whole(_name, KEYS_ONLY))
+TDict.__len__ = _whole("__len__", SIZE)
 
 
 def _tdict(value, owner, name):

@@ -15,4 +15,9 @@ COPY selector.py verify.py tpcds_check.py /app/
 COPY maps /app/maps
 RUN chmod -R a+rX /app && python -m compileall -q /app/selector.py /app/verify.py /app/tpcds_check.py
 
+# What importing the pinned commit gives (failures, and the values importing
+# leaves behind), for the import checks to compare patched code with.
+RUN cd /tmp && HOME=/tmp python -I /app/selector.py --import-baseline /app/maps/import_base.json \
+    && chmod a+r /app/maps/import_base.json
+
 CMD ["python", "-I", "/app/selector.py"]

@@ -8,6 +8,8 @@ so the caller only ever selects more.
 """
 
 import concurrent.futures
+import enum
+import hashlib
 import importlib.abc
 import importlib.util
 import json
@@ -17,6 +19,7 @@ import select
 import signal
 import sys
 import time
+import types
 
 SRC = None
 
@@ -274,9 +277,150 @@ def _import_everything(test_files):
     return sorted(set(failed))
 
 
-def start_import_check(src, files, deleted, test_files):
+def _ktok(key):
+    """A dict key as the map records it (mapper/brmap.py's _ktok)."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, type):
+        return key.__name__
+    if isinstance(key, enum.Enum):
+        return key.name
+    if isinstance(key, (int, float, bool)) or key is None:
+        return repr(key)
+    return "?"
+
+
+_CODE = {}
+
+
+def _h(x):
+    return hashlib.blake2b(repr(x).encode(), digest_size=8).hexdigest()
+
+
+def _code_key(code):
+    k = _CODE.get(id(code))
+    if k is None:
+        consts = [_code_key(c) if hasattr(c, "co_code")
+                  else repr(sorted(map(repr, c))) if isinstance(c, frozenset)  # `x in {"a", "b"}`: seed order
+                  else repr(c) for c in code.co_consts]
+        k = _CODE[id(code)] = _h((code.co_code, consts, code.co_names))
+    return k
+
+
+def _vkey(v, depth=0):
+    """A stable description of a value built at import, or None."""
+    if depth > 6:
+        return None
+    if v is None or isinstance(v, (bool, int, float, str, bytes)):
+        return (type(v).__name__, v)
+    if isinstance(v, enum.Enum):
+        return ("enum", type(v).__qualname__, v.name)
+    if isinstance(v, type):
+        return ("type", v.__module__, v.__qualname__)
+    if isinstance(v, types.FunctionType):
+        cells = tuple(_vkey(c.cell_contents, depth + 1) for c in v.__closure__ or ())
+        return ("func", v.__module__, v.__qualname__, _code_key(v.__code__), _vkey(v.__defaults__, depth + 1),
+                _vkey(v.__kwdefaults__, depth + 1), cells)
+    if isinstance(v, (types.BuiltinFunctionType, types.BuiltinMethodType)):
+        return ("builtin", getattr(v, "__module__", None), v.__qualname__)
+    if isinstance(v, (classmethod, staticmethod)):
+        return (type(v).__name__, _vkey(v.__func__, depth + 1))
+    if isinstance(v, property):
+        return ("property", _vkey(v.fget, depth + 1), _vkey(v.fset, depth + 1), _vkey(v.fdel, depth + 1))
+    if isinstance(v, (list, tuple)):
+        items = tuple(_vkey(x, depth + 1) for x in v)
+        if v and all(isinstance(x, type) for x in v):
+            # isinstance() targets, often tuple(set_of_classes): any order.
+            items = tuple(sorted(items))
+        return (type(v).__name__, items)
+    if isinstance(v, (set, frozenset)):
+        return (type(v).__name__, tuple(sorted(repr(_vkey(x, depth + 1)) for x in v)))
+    if isinstance(v, dict):
+        # In any order: dicts built from sets come out in a different order
+        # in every process (classes hash by address, strings by seed).
+        return ("dict", tuple(sorted(repr((_vkey(k, depth + 1), _vkey(x, depth + 1))) for k, x in v.items())))
+    r = repr(v)
+    return None if " at 0x" in r or " object at " in r else ("repr", type(v).__qualname__, r)
+
+
+def module_state():
+    """What importing left behind in sqlglot's and the tests' modules:
+    ({("m", file, name) or ("c", "file::Class", name): hash, or None when the
+    value has no stable form}, {same key: {dict key token: hash}}, keys whose
+    value is a function)."""
+    flat, keyed, funcs = {}, {}, set()
+
+    def put(key, value):
+        d = _vkey(value)
+        flat[key] = None if d is None else _h(d)
+        if callable(value) and not isinstance(value, type) or isinstance(value, (classmethod, staticmethod, property)):
+            funcs.add(key)
+        if isinstance(value, dict):
+            per = {}
+            for k, x in value.items():
+                t = _ktok(k)
+                per[t] = _h((per.get(t), _vkey(x)))
+            keyed[key] = per
+
+    for name, mod in list(sys.modules.items()):
+        if not (name in ("sqlglot", "tests") or name.startswith(("sqlglot.", "tests."))):
+            continue
+        path = getattr(mod, "__file__", None) or ""
+        if not path.startswith(SRC + "/"):
+            continue
+        rel = path[len(SRC) + 1:]
+
+        def walk(cls, qual):
+            for a, x in list(vars(cls).items()):
+                if a.startswith("__") or a == "_abc_impl":
+                    continue
+                if isinstance(x, type) and x.__module__ == name and x.__qualname__ == f"{qual}.{a}":
+                    walk(x, f"{qual}.{a}")
+                else:
+                    put(("c", f"{rel}::{qual}", a), x)
+
+        for k, v in list(vars(mod).items()):
+            if k.startswith("__") or isinstance(v, types.ModuleType) or k == "_import_lock":
+                continue
+            if isinstance(v, type) and v.__module__ == name and v.__qualname__ == k:
+                walk(v, k)
+            else:
+                put(("m", rel, k), v)
+    return flat, keyed, funcs
+
+
+def state_diff(base, new):
+    """[kind, owner, name, changed values, added or removed keys, function?]
+    between two module_state()s; the middle two are None unless both values
+    are dicts. The
+    base's values are sets: every value seen at the pinned commit across
+    hash seeds (a loop variable left in a class body can hold any element of
+    the set it looped over)."""
+    (bflat, bkeyed, bfuncs), (nflat, nkeyed, nfuncs) = base, new
+    out = []
+    for key in set(bflat) | set(nflat):
+        b, n = bflat.get(key, {"-"}), nflat.get(key, "-")
+        if n in b and n is not None:
+            continue
+        if None in b and n is None:
+            continue  # no stable form either way (abc caches)
+        vals = keys = None
+        if key in bkeyed and key in nkeyed and n is not None and None not in b:
+            bk, nk = bkeyed[key], nkeyed[key]
+            vals = sorted(t for t in set(bk) & set(nk) if nk[t] not in bk[t])
+            keys = sorted(set(bk) ^ set(nk))
+        out.append([key[0], key[1], key[2], vals, keys, key in bfuncs or key in nfuncs])
+    return out
+
+
+BASE_STATE = None  # the pinned commit's module_state(), set before forking checks
+
+
+def start_import_check(src, files, deleted, test_files, state=False):
     """Fork a child that imports everything on the patched code (see
-    _import_everything). Returns a handle for poll_json."""
+    _import_everything); with state, it also reports what importing left
+    behind: whole (no BASE_STATE yet) or as a diff from BASE_STATE. Returns a
+    handle for poll_json."""
     global SRC
     SRC = str(src)
     r, w = os.pipe()
@@ -292,7 +436,15 @@ def start_import_check(src, files, deleted, test_files):
             os.environ["SKIP_INTEGRATION"] = "0"
             _install_stubs()
             sys.meta_path.insert(0, _Overlay(files, deleted))
-            os.write(w, json.dumps({"failed": _import_everything(test_files)}).encode())
+            out = {"failed": _import_everything(test_files)}
+            if state:
+                st = module_state()
+                if BASE_STATE is None:
+                    out["state"] = ([[list(k), v] for k, v in st[0].items()],
+                                    [[list(k), v] for k, v in st[1].items()], [list(k) for k in st[2]])
+                else:
+                    out["diff"] = state_diff(BASE_STATE, st)
+            os.write(w, json.dumps(out).encode())
         except BaseException:  # noqa: BLE001
             pass
         os._exit(0)

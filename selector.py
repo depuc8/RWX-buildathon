@@ -580,6 +580,7 @@ class Selector:
         files  path -> patched text of every changed Python file
         """
         self.m.light, self.m.light_used = light, False
+        self.state_check = False  # the light selection needs the import check's state diff
         self.must = 0
         self.files = {}
         self.deleted = set()  # Python files the patch deletes or renames away
@@ -679,6 +680,7 @@ class Selector:
             self.must |= m.module_impact_full(f)
             return 0
         self.files[f] = new_text
+        self.trees = (old, new)
         if old.dump() == new.dump():
             log(f"  {f}: same syntax tree (comments or formatting)")
             return 0
@@ -967,26 +969,55 @@ class Selector:
         names = assigned_names(s)
         if not names or ckey not in m.tracked:
             return self.class_mask(f, cq)
+        reads = None  # dict key tokens whose readers can see the change
+        if len(names) == 1 and isinstance(getattr(s, "value", None), ast.Dict):
+            toks = dict_entry_tokens(s.value, a, b)
+            if toks is not None:
+                # A value changed: readers of those keys and of the values as a
+                # whole. Keys came or went: also key iteration and size.
+                reads = {"*", *toks}
+                if not self.same_keys(cq, next(iter(names))):
+                    reads |= {"#keys", "#len"}
         if names & m.derived:
+            if m.light:
+                # What was built from it when classes were created: the import
+                # check compares everything importing left behind.
+                self.state_check = True
+                m.light_used = True
+                mask = m.eager_tests(f)
+                for n in names:
+                    mask |= m.attr_users(ckey, n) if reads is None else key_mask(m, ckey, n, reads)
+                return mask
             # Built into something else when classes are created: every user
             # of the class, and modules that read it while importing.
             mask = m.class_users(f, cq) | self.outer_users(f, cq) | m.eager_tests(f)
             for n in names:
                 mask |= m.import_read(ckey, n)
             return mask
-        toks = None
-        if len(names) == 1 and isinstance(getattr(s, "value", None), ast.Dict):
-            toks = dict_entry_tokens(s.value, a, b)
         mask = m.eager_tests(f)
         for n in names:
-            mask |= m.import_read(ckey, n, toks)
-            if toks is None:
-                mask |= m.attr_users(ckey, n)
-            else:
-                mask |= m.key_users(ckey, n, "*")
-                for t in toks:
-                    mask |= m.key_users(ckey, n, t)
+            mask |= m.import_read(ckey, n, reads)
+            mask |= m.attr_users(ckey, n) if reads is None else key_mask(m, ckey, n, reads)
         return mask
+
+    def same_keys(self, cq, name):
+        """Does the dict display assigned to `name` in class cq have the same
+        static keys, in the same order, before and after?"""
+        def keys(tree):
+            node = tree.tree
+            for part in cq.split("."):
+                node = next((c for c in node.body if isinstance(c, ast.ClassDef) and c.name == part), None)
+                if node is None:
+                    return None
+            for st in node.body:
+                if assigned_names(st) == {name} and isinstance(st.value, ast.Dict):
+                    ks = [static_key(k) if k is not None else None for k in st.value.keys]
+                    return None if None in ks else ks
+            return None
+
+        old, new = self.trees
+        k = keys(old)
+        return k is not None and k == keys(new)
 
     def new_def_mask(self, f, old, path, idx, name):
         m = self.m
@@ -1412,6 +1443,37 @@ def assigned_names(s):
     return names
 
 
+def key_mask(m, ckey, name, reads):
+    mask = 0
+    for t in reads:
+        mask |= m.key_users(ckey, name, t)
+    return mask
+
+
+def diff_users(m, diff, patched):
+    """Tests that can see what importing the patched code left behind
+    differently (verify.state_diff), or None when that cannot be told."""
+    mask = 0
+    for kind, owner, name, vals, keys, func in diff:
+        if func:
+            # A function built or bound at import: its body's own changes are
+            # covered line by line; anything else (closures) is not.
+            if owner.split("::")[0] in patched:
+                continue
+            return None
+        if kind == "c":
+            if owner not in m.tracked:
+                return None
+            if vals is None:
+                mask |= m.attr_users(owner, name)
+            else:
+                mask |= key_mask(m, owner, name, {"*", *vals} | ({"#keys", "#len", *keys} if keys else set()))
+        else:
+            for g, uses in name_references(owner, {name}).items():
+                mask |= m.line_users(g, uses)
+    return mask
+
+
 def static_key(node):
     """The token a dict key is recorded under at runtime (str, class or enum
     member name, number), or None when it cannot be known statically."""
@@ -1590,8 +1652,11 @@ def split(numbers, ms):
 # it here costs its seconds of CPU. So we only run the cheap candidates, and
 # only when the best outcome (they all pass) beats listing everything.
 
-# Smallest saving worth an import check (which costs about half a second).
+# Smallest saving worth an import check (about half a second of CPU, two
+# when it also compares what importing left behind).
 IMPORT_CHECK_MS = int(os.environ.get("BR_IMPORT_CHECK_MS", 1000))
+STATE_CHECK_MS = int(os.environ.get("BR_STATE_CHECK_MS", 2500))
+IMPORT_BASE = Path(os.environ.get("BR_IMPORT_BASE", HERE / "maps" / "import_base.json"))
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", 1500))  # never run these here
 VERIFY_MAX_MS = int(os.environ.get("BR_VERIFY_MAX_MS", 4000))
 # With no heavy candidate to drop, a verification can only save a worker or
@@ -1704,7 +1769,56 @@ def tpcds_queries(tp, sel, m, must, maybe):
     return sorted(numbers_of(affected, max(tp["baseline"]) + 1), key=lambda i: tp["cost"].get(i, 0)), attrs
 
 
-def run_import_checks(plans):
+def test_module_files():
+    """Every test module, as the import checks import them (the same list
+    when the image is built and when it runs)."""
+    return sorted(str(p.relative_to(SRC)) for p in (SRC / "tests").rglob("test_*.py"))
+
+
+def import_baseline(out_path, seeds=6):
+    """What the import check finds at the pinned commit, with every value
+    importing leaves behind under several hash seeds: computed when the
+    image is built."""
+    import subprocess
+
+    runs = []
+    for seed in range(seeds):
+        res = subprocess.run([sys.executable, "-I", __file__, "--import-baseline-one"], capture_output=True,
+                             text=True, env=dict(os.environ, PYTHONHASHSEED=str(seed)), check=True)
+        runs.append(json.loads(res.stdout))
+    failed = sorted(set().union(*(r["failed"] for r in runs)))
+    flat, keyed = {}, {}
+    for r in runs:
+        rflat, rkeyed, funcs = r["state"]
+        for k, v in rflat:
+            flat.setdefault(tuple(k), set()).add(v)
+        for k, per in rkeyed:
+            d = keyed.setdefault(tuple(k), {})
+            for t, h in per.items():
+                d.setdefault(t, set()).add(h)
+    out = {"failed": failed,
+           "state": ([[list(k), sorted(v, key=str)] for k, v in flat.items()],
+                     [[list(k), {t: sorted(h, key=str) for t, h in per.items()}] for k, per in keyed.items()],
+                     funcs)}
+    Path(out_path).write_text(json.dumps(out))
+    unstable = sum(len(v) > 1 for v in flat.values())
+    log(f"import baseline: {len(failed)} modules fail at the pinned commit; {len(flat)} values, {unstable} seed-dependent")
+
+
+def import_baseline_one():
+    sys.path.insert(0, str(HERE))
+    import verify
+
+    h = verify.start_import_check(SRC, {}, (), test_module_files(), True)
+    while (res := verify.poll_json(h, 600)) is None:
+        time.sleep(0.05)
+    status, out = res
+    if status != "done":
+        raise SystemExit(f"import baseline failed: {status}")
+    print(json.dumps(out))
+
+
+def run_import_checks(plans, m):
     """For each plan with a light selection (one that assumes every module
     still imports), import everything on the patched code; any module or
     test file that imported at the pinned commit and now fails sends the
@@ -1715,22 +1829,38 @@ def run_import_checks(plans):
     sys.path.insert(0, str(HERE))
     import verify
 
-    test_files = sorted(TESTS_BY_FILE)
-    h = verify.start_import_check(SRC, {}, (), test_files)
-    while (res := verify.poll_json(h, 60)) is None:
-        time.sleep(0.01)
-    status, out = res
+    test_files = test_module_files()
+    state = any(p["state"] for p in todo)
+    try:
+        # Made when the image was built (selector.py --import-baseline).
+        status, out = "done", json.loads(IMPORT_BASE.read_text())
+    except (OSError, ValueError):
+        h = verify.start_import_check(SRC, {}, (), test_files, state)
+        while (res := verify.poll_json(h, 60)) is None:
+            time.sleep(0.01)
+        status, out = res
     if status != "done" or not isinstance(out, dict):
         log(f"import check baseline failed ({status}); using full selections")
         for p in todo:
             p["must"], p["maybe"] = p["full"]
         return
     baseline = set(out["failed"])
+    if state and "state" not in out:
+        log("import check baseline has no state; using full selections")
+        for p in todo:
+            if p["state"]:
+                p["must"], p["maybe"] = p["full"]
+        todo = [p for p in todo if not p["state"]]
+    elif state:
+        flat, keyed, funcs = out["state"]
+        verify.BASE_STATE = ({tuple(k): set(v) for k, v in flat},
+                             {tuple(k): {t: set(h) for t, h in per.items()} for k, per in keyed},
+                             {tuple(k) for k in funcs})
     queue, running = list(todo), []
     while queue or running:
         while queue and len(running) < PARALLEL:
             p = queue.pop(0)
-            running.append((p, verify.start_import_check(SRC, p["files"], p["deleted"], test_files)))
+            running.append((p, verify.start_import_check(SRC, p["files"], p["deleted"], test_files, p["state"])))
         still = []
         for p, h in running:
             res = verify.poll_json(h, 30)
@@ -1739,7 +1869,15 @@ def run_import_checks(plans):
                 continue
             status, out = res
             broken = sorted(set(out["failed"]) - baseline) if status == "done" and isinstance(out, dict) else None
+            extra = 0
+            if broken == [] and p["state"]:
+                # Readers of whatever else importing left behind differently.
+                extra = diff_users(m, out.get("diff", ()), set(p["files"]) | p["deleted"])
+                if extra is None:
+                    broken = ["(import-time state changed in a way that cannot be traced)"]
             if broken == []:
+                fmust, fmaybe = p["full"]
+                p["maybe"] |= extra & (fmust | fmaybe) & ~p["must"]
                 log(f"{p['commit']}: everything still imports ({h.get('cpu', 0):.2f} s CPU); light selection")
             else:
                 log(f"{p['commit']}: import check {'failed: ' + ', '.join(broken[:5]) if broken else status}; "
@@ -1817,7 +1955,7 @@ def main():
         text = patch.read_text(encoding="utf-8", errors="replace")
         must, maybe, files = sel.select(text, light=True)
         plan = {"commit": patch.stem, "must": must, "maybe": maybe, "files": files, "deleted": set(sel.deleted),
-                "verify": False, "full": None}
+                "verify": False, "full": None, "state": sel.state_check}
         if m.light_used:
             # Both are sound when the patched code still imports everywhere,
             # and only the full one otherwise: an import check decides,
@@ -1826,7 +1964,7 @@ def main():
             both = fmust | fmaybe
             must, maybe = must & both, maybe & both
             saving = cost_of(split(numbers_of(both, n), ms), ms) - cost_of(split(numbers_of(must | maybe, n), ms), ms)
-            if saving > IMPORT_CHECK_MS:
+            if saving > (STATE_CHECK_MS if plan["state"] else IMPORT_CHECK_MS):
                 plan["must"], plan["maybe"] = must, maybe
                 plan["full"] = (fmust, fmaybe)
             else:
@@ -1838,7 +1976,7 @@ def main():
         plan["tpcds"], plan["tpcds_attrs"] = tq or (None, False)
         plans.append(plan)
 
-    run_import_checks(plans)
+    run_import_checks(plans, m)
 
     for plan in plans:
         must, maybe = plan["must"], plan["maybe"]
@@ -1933,4 +2071,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--import-baseline"]:
+        import_baseline(sys.argv[2])
+    elif sys.argv[1:2] == ["--import-baseline-one"]:
+        import_baseline_one()
+    else:
+        main()

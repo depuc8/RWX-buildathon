@@ -218,7 +218,8 @@ class _Anything:
 
 class _Stubs(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """Stand-ins for third-party packages this image lacks (duckdb, pandas,
-    numpy), so test modules that import them can still be imported."""
+    numpy, pytz, setuptools), so test modules that import them can still be
+    imported."""
 
     def __init__(self, tops):
         self.tops = tops
@@ -237,7 +238,7 @@ class _Stubs(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
 
 def _install_stubs():
-    missing = {t for t in ("duckdb", "pandas", "numpy") if importlib.util.find_spec(t) is None}
+    missing = {t for t in ("duckdb", "pandas", "numpy", "pytz", "setuptools") if importlib.util.find_spec(t) is None}
     if missing:
         sys.meta_path.append(_Stubs(missing))
 

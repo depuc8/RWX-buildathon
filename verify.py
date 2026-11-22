@@ -243,6 +243,15 @@ def _install_stubs():
         sys.meta_path.append(_Stubs(missing))
 
 
+def _like_pytest():
+    """Make this process look like the pytest run the labels come from, for
+    code that checks: sqlglot validates expressions more strictly when
+    unittest or pytest is loaded (expressions/core.py UNITTEST)."""
+    import unittest  # noqa: F401
+
+    sys.modules.setdefault("pytest", types.ModuleType("pytest"))
+
+
 def _import_everything(test_files):
     """Import every sqlglot module, load every dialect and import every test
     module; return the names of those that fail."""
@@ -436,6 +445,7 @@ def start_import_check(src, files, deleted, test_files, state=False):
             sys.dont_write_bytecode = True
             os.environ["SKIP_INTEGRATION"] = "0"
             _install_stubs()
+            _like_pytest()
             sys.meta_path.insert(0, _Overlay(files, deleted))
             out = {"failed": _import_everything(test_files)}
             if state:
@@ -468,6 +478,7 @@ def start_tpcds(src, files, indices, baseline=None, deleted=(), attrs=None, runs
             os.chdir(SRC)
             sys.path.insert(0, SRC)
             sys.dont_write_bytecode = True
+            _like_pytest()
             sys.meta_path.insert(0, _Overlay(files, deleted))
             # In the suite run, earlier tests have imported every module by
             # the time this test runs: let patched ones have their import-time

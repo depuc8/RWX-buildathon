@@ -137,11 +137,65 @@ def attr_fingerprints(data_attrs):
     return out
 
 
-def fingerprints(indices=None, baseline=None):
+def _open_file(file_name):
+    """tests/test_executor.py's open_file."""
+    with open(file_name, "rb") as f:
+        gzipped = f.read(2) == b"\x1f\x8b"
+    if gzipped:
+        import gzip
+
+        return gzip.open(file_name, "rt", newline="")
+    return open(file_name, encoding="utf-8", newline="")
+
+
+def load_table(name):
+    """One TPC-DS table, built the way TestExecutor.setUpClass builds it."""
+    import ast
+    import csv
+
+    from sqlglot.executor.table import Table
+    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA
+
+    columns = TPCDS_SCHEMA[name]
+    reader = csv.reader(_open_file(f"{FIXTURES_DIR}/optimizer/tpc-ds/{name}.csv.gz"), delimiter="|")
+    rows = []
+    ctypes = []
+    next(reader)
+    for row in reader:
+        if not ctypes:
+            for i, v in enumerate(row):
+                try:
+                    ctypes.append(type(ast.literal_eval(v)))
+                except (ValueError, SyntaxError):
+                    ctypes.append(str)
+        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return Table(columns=columns, rows=rows)
+
+
+def run_query(expr, tables):
+    """What a pool worker returns for this parsed query (mp_execute), as a
+    hash of its columns and rows; None if it raises."""
+    import sqlglot.executor as ex
+    from sqlglot import find_tables
+    from tests.helpers import TPCDS_SCHEMA
+
+    try:
+        schema = pickle.loads(pickle.dumps(TPCDS_SCHEMA))
+        used = pickle.loads(pickle.dumps({t.name: tables[t.name] for t in find_tables(expr)}))
+        table = pickle.loads(pickle.dumps(ex.execute(expr, schema=schema, tables=used)))
+        return hashlib.sha256(repr((list(table.columns), table.rows)).encode()).hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def fingerprints(indices=None, baseline=None, ducks=None, duck_baseline=None, plan_only=None, affordable=None):
     """{query index: fingerprint of everything the test derives from it
     before running a plan}. A query whose fingerprinting raises gets None.
+    ducks, if given, receives each executed query's DuckDB SQL hash.
     With baseline ({index: allowed fingerprints}), stop at the first query
-    that matches none of them: one difference already decides."""
+    that matches none of them: one difference already decides; unless only
+    its plan differs (its DuckDB SQL is in duck_baseline), which goes to
+    plan_only for run_query to settle, as long as affordable(plan_only)."""
     import sqlglot.executor as ex
     import sqlglot.executor.python as py
     from sqlglot import find_tables, parse_one, transpile
@@ -188,11 +242,19 @@ def fingerprints(indices=None, baseline=None):
                         "root": _step(plan.root),
                         "tables": _canon(captured["tables"].mapping),
                     })
-                    parts.append(transpile(sql, write="duckdb")[0])
+                    duck = transpile(sql, write="duckdb")[0]
+                    parts.append(duck)
+                    if ducks is not None:
+                        ducks[i] = hashlib.sha256(duck.encode()).hexdigest()
                 out[i] = hashlib.sha256(_jkey(parts).encode()).hexdigest()
             except Exception:  # noqa: BLE001  (the real test fails too, or differs)
                 out[i] = None
             if baseline is not None and out[i] not in baseline.get(i, ()):
+                if (plan_only is not None and out[i] is not None and meta.get("execute")
+                        and ducks.get(i) in duck_baseline.get(i, ())):
+                    plan_only.append(i)
+                    if affordable is None or affordable(plan_only):
+                        continue
                 break
     finally:
         py.PythonExecutor.execute = orig

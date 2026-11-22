@@ -37,6 +37,9 @@ TPCDS = os.environ.get("BR_TPCDS", "1") == "1"
 # Share of plan-phase-only patches whose TPC-DS plans come out identical
 # (about 0.4 on the local benches): what a check is expected to save.
 TPCDS_HIT_RATE = float(os.environ.get("BR_TPCDS_HIT_RATE", 0.4))
+# CPU seconds (measured at the pinned commit) worth spending on running
+# queries whose plans changed, to keep test_execute_tpcds (21 s) off the list.
+TPCDS_RUN_BUDGET = float(os.environ.get("BR_TPCDS_RUN_BUDGET", 5))
 
 MAX_WORKERS = 8
 WORKER_MS = 2000
@@ -1618,6 +1621,16 @@ def load_tpcds(tests):
         "worker": set(t.get("worker_modules", ())),
         "data_attrs": t.get("data_attrs"),
         "attr_baseline": t.get("attr_baseline"),
+        # Queries whose plan changed but not their DuckDB SQL are run over the
+        # data, within a CPU budget, and their rows compared.
+        "runs": {
+            "duck_baseline": {int(i): set(v) for i, v in t["duck_baseline"].items()},
+            "results": {int(i): set(v) for i, v in t["results"].items()},
+            "exec_cost": {int(i): c for i, c in t["exec_cost"].items()},
+            "tables": {int(i): v for i, v in t["tables"].items()},
+            "load_cost": t["load_cost"],
+            "budget": TPCDS_RUN_BUDGET,
+        } if "results" in t else None,
     }
 
 
@@ -1706,13 +1719,13 @@ def run_import_checks(plans):
     h = verify.start_import_check(SRC, {}, (), test_files)
     while (res := verify.poll_json(h, 60)) is None:
         time.sleep(0.01)
-    status, baseline = res
-    if status != "done":
+    status, out = res
+    if status != "done" or not isinstance(out, dict):
         log(f"import check baseline failed ({status}); using full selections")
         for p in todo:
             p["must"], p["maybe"] = p["full"]
         return
-    baseline = set(baseline)
+    baseline = set(out["failed"])
     queue, running = list(todo), []
     while queue or running:
         while queue and len(running) < PARALLEL:
@@ -1724,8 +1737,8 @@ def run_import_checks(plans):
             if res is None:
                 still.append((p, h))
                 continue
-            status, failed = res
-            broken = None if status != "done" else sorted(set(failed) - baseline)
+            status, out = res
+            broken = sorted(set(out["failed"]) - baseline) if status == "done" and isinstance(out, dict) else None
             if broken == []:
                 log(f"{p['commit']}: everything still imports ({h.get('cpu', 0):.2f} s CPU); light selection")
             else:
@@ -1750,24 +1763,24 @@ def run_tpcds_checks(tp, plans):
             p = queue.pop(0)
             attrs = (tp["data_attrs"], tp["attr_baseline"]) if p["tpcds_attrs"] else None
             running.append((p, verify.start_tpcds(SRC, p["files"], p["tpcds"],
-                                                  {i: tp["baseline"][i] for i in p["tpcds"]}, p["deleted"], attrs)))
+                                                  {i: tp["baseline"][i] for i in p["tpcds"]}, p["deleted"], attrs,
+                                                  tp["runs"])))
         still = []
         for p, h in running:
             # A check runs about as long as its queries did at the pinned
             # commit; far longer means the patch made sqlglot slow or loop,
             # and then the real test would time out too.
-            res = verify.poll_json(h, 1.5 + 3 * sum(tp["cost"].get(i, 0.1) for i in p["tpcds"]))
+            res = verify.poll_json(h, 1.5 + 3 * sum(tp["cost"].get(i, 0.1) for i in p["tpcds"]) + 3 * TPCDS_RUN_BUDGET)
             if res is None:
                 still.append((p, h))
                 continue
-            status, fps = res
-            same = status == "done" and len(fps) == len(p["tpcds"]) and all(  # stopped early = differs
-                fps.get(str(i)) in tp["baseline"].get(i, ()) for i in p["tpcds"]
-            )
+            status, out = res
+            same = status == "done" and out.get("same") is True
             if same:
                 p["heavy"] &= ~(1 << tp["num"])
                 p["light"] &= ~(1 << tp["num"])
-            log(f"{p['commit']}: TPC-DS check over {len(p['tpcds'])} queries"
+            ran = f", {out.get('ran')} of {out.get('plan_only')} changed plans run" if status == "done" and out.get("plan_only") else ""
+            log(f"{p['commit']}: TPC-DS check over {len(p['tpcds'])} queries{ran}"
                 f"{' and data-phase attributes' if p['tpcds_attrs'] else ''}: "
                 f"{'identical, test_execute_tpcds dropped' if same else 'differs, kept'} "
                 f"({h.get('cpu', 0):.2f} s CPU)")

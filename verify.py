@@ -292,7 +292,7 @@ def start_import_check(src, files, deleted, test_files):
             os.environ["SKIP_INTEGRATION"] = "0"
             _install_stubs()
             sys.meta_path.insert(0, _Overlay(files, deleted))
-            os.write(w, json.dumps(_import_everything(test_files)).encode())
+            os.write(w, json.dumps({"failed": _import_everything(test_files)}).encode())
         except BaseException:  # noqa: BLE001
             pass
         os._exit(0)
@@ -300,7 +300,7 @@ def start_import_check(src, files, deleted, test_files):
     return {"pid": pid, "fd": r, "buf": b"", "t0": time.monotonic()}
 
 
-def start_tpcds(src, files, indices, baseline=None, deleted=(), attrs=None):
+def start_tpcds(src, files, indices, baseline=None, deleted=(), attrs=None, runs=None):
     """Fork a child that fingerprints these TPC-DS queries on the patched files
     (see tpcds_check). Returns a handle for poll_json."""
     global SRC
@@ -336,8 +336,39 @@ def start_tpcds(src, files, indices, baseline=None, deleted=(), attrs=None):
                 if tpcds_check.attr_fingerprints(data_attrs) != attr_baseline:
                     os.write(w, json.dumps({}).encode())  # nothing matches: differs
                     os._exit(0)
-            fp = tpcds_check.fingerprints(indices, baseline)
-            os.write(w, json.dumps({str(k): v for k, v in fp.items()}).encode())
+            ducks, plan_only = {}, []
+
+            def affordable(queries):
+                need = {t for i in queries for t in runs["tables"].get(i, ())}
+                est = sum(runs["exec_cost"].get(i, 1) for i in queries) + sum(runs["load_cost"].get(t, 1) for t in need)
+                return est <= runs["budget"]
+
+            fp = tpcds_check.fingerprints(indices, baseline, ducks, runs and runs["duck_baseline"],
+                                          plan_only if runs else None, affordable)
+            same = len(fp) == len(indices) and all(fp[i] in baseline[i] for i in indices if i not in plan_only)
+            ran = 0
+            if same and plan_only:
+                # Only plans differ: run those queries over the data (cheapest
+                # first) and compare the rows with the pinned commit's.
+                plan_only.sort(key=lambda i: runs["exec_cost"].get(i, 1))
+                if not affordable(plan_only):
+                    same = False
+                else:
+                    from sqlglot import parse_one
+                    from tests.helpers import load_sql_fixture_pairs
+
+                    entries = list(load_sql_fixture_pairs(tpcds_check.FIXTURE))
+                    tables = {}
+                    for i in plan_only:
+                        expr = pickle.loads(pickle.dumps(parse_one(entries[i][1])))
+                        for t in runs["tables"].get(i, ()):
+                            if t not in tables:
+                                tables[t] = tpcds_check.load_table(t)
+                        ran += 1
+                        if tpcds_check.run_query(expr, tables) not in runs["results"].get(i, ()):
+                            same = False
+                            break
+            os.write(w, json.dumps({"same": same, "ran": ran, "plan_only": len(plan_only)}).encode())
         except BaseException:  # noqa: BLE001
             pass
         os._exit(0)

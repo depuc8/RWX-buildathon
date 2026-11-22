@@ -43,19 +43,26 @@ def warm_up(src):
             pass
 
 
-class _Overlay(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Serve patched source for the modules a patch changes."""
+def _module_name(path):
+    name = path[:-3].replace("/", ".")
+    return name[: -len(".__init__")] if name.endswith(".__init__") else name
 
-    def __init__(self, files):
+
+class _Overlay(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Serve patched source for the modules a patch changes, and hide the
+    ones it deletes."""
+
+    def __init__(self, files, deleted=()):
         self.by_module = {}
         for path, text in files.items():
-            name = path[:-3].replace("/", ".")
-            is_pkg = name.endswith(".__init__")
-            if is_pkg:
-                name = name[: -len(".__init__")]
-            self.by_module[name] = (os.path.join(SRC, path), text, is_pkg)
+            if text is None or not path.endswith(".py"):
+                continue
+            self.by_module[_module_name(path)] = (os.path.join(SRC, path), text, path.endswith("/__init__.py"))
+        self.deleted = {_module_name(p) for p in deleted if p.endswith(".py")} - set(self.by_module)
 
     def find_spec(self, fullname, path=None, target=None):
+        if fullname in self.deleted:
+            raise ModuleNotFoundError(f"No module named {fullname!r}", name=fullname)
         entry = self.by_module.get(fullname)
         if entry is None:
             return None
@@ -194,7 +201,106 @@ def _child(files, nodeids, wfd):
     os._exit(0)
 
 
-def start_tpcds(src, files, indices, baseline=None):
+class _Anything:
+    """Whatever a stubbed package hands out at import time."""
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _Anything()
+
+    def __call__(self, *a, **k):
+        return _Anything()
+
+
+class _Stubs(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Stand-ins for third-party packages this image lacks (duckdb, pandas,
+    numpy), so test modules that import them can still be imported."""
+
+    def __init__(self, tops):
+        self.tops = tops
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in self.tops:
+            return importlib.util.spec_from_loader(fullname, self, is_package=True)
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        module.__path__ = []
+        module.__getattr__ = lambda name: _Anything()
+
+
+def _install_stubs():
+    missing = {t for t in ("duckdb", "pandas", "numpy") if importlib.util.find_spec(t) is None}
+    if missing:
+        sys.meta_path.append(_Stubs(missing))
+
+
+def _import_everything(test_files):
+    """Import every sqlglot module, load every dialect and import every test
+    module; return the names of those that fail."""
+    import pkgutil
+
+    failed = []
+    try:
+        import sqlglot
+    except BaseException:  # noqa: BLE001
+        return ["sqlglot"]
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot.", onerror=failed.append):
+        if info.name == "sqlglot.__main__":
+            continue
+        try:
+            importlib.import_module(info.name)
+        except BaseException:  # noqa: BLE001
+            failed.append(info.name)
+    try:
+        from sqlglot.dialects.dialect import Dialect, Dialects
+
+        for d in Dialects:
+            try:
+                Dialect.get_or_raise(d.value)
+            except BaseException:  # noqa: BLE001
+                failed.append(f"dialect:{d.value}")
+    except BaseException:  # noqa: BLE001
+        failed.append("sqlglot.dialects.dialect")
+    for path in test_files:
+        try:
+            importlib.import_module(_module_name(path))
+        except BaseException:  # noqa: BLE001
+            failed.append(path)
+    return sorted(set(failed))
+
+
+def start_import_check(src, files, deleted, test_files):
+    """Fork a child that imports everything on the patched code (see
+    _import_everything). Returns a handle for poll_json."""
+    global SRC
+    SRC = str(src)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+            os.chdir(SRC)
+            sys.path.insert(0, SRC)
+            sys.dont_write_bytecode = True
+            os.environ["SKIP_INTEGRATION"] = "0"
+            _install_stubs()
+            sys.meta_path.insert(0, _Overlay(files, deleted))
+            os.write(w, json.dumps(_import_everything(test_files)).encode())
+        except BaseException:  # noqa: BLE001
+            pass
+        os._exit(0)
+    os.close(w)
+    return {"pid": pid, "fd": r, "buf": b"", "t0": time.monotonic()}
+
+
+def start_tpcds(src, files, indices, baseline=None, deleted=()):
     """Fork a child that fingerprints these TPC-DS queries on the patched files
     (see tpcds_check). Returns a handle for poll_json."""
     global SRC
@@ -209,12 +315,12 @@ def start_tpcds(src, files, indices, baseline=None):
             os.chdir(SRC)
             sys.path.insert(0, SRC)
             sys.dont_write_bytecode = True
-            sys.meta_path.insert(0, _Overlay(files))
+            sys.meta_path.insert(0, _Overlay(files, deleted))
             # In the suite run, earlier tests have imported every module by
             # the time this test runs: let patched ones have their import-time
             # effects here too.
             for path in sorted(files):
-                if path.startswith("sqlglot/") and path.endswith(".py"):
+                if path.startswith("sqlglot/") and path.endswith(".py") and files[path] is not None:
                     name = path[:-3].replace("/", ".").removesuffix(".__init__")
                     try:
                         importlib.import_module(name)

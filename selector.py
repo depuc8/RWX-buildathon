@@ -66,6 +66,13 @@ class Map:
         # change inside a body has an import-time effect only if those ran.
         self.import_func_lines = m.get("import_func_lines", self.import_lines)
         self.importers = m["importers"]
+        self.direct_importers = m.get("direct_importers", {})
+        # Light mode: assume every module still imports (an import check run
+        # on the patched code confirms it), so a module-level change reaches
+        # the users of that module and of its direct importers, not every
+        # module that imports it transitively (which is nearly all of them).
+        self.light = False
+        self.light_used = False
         self.attrs = m.get("attrs", {})
         self.keys = m.get("keys", {})
         self.derived = set(m.get("derived", ()))
@@ -128,6 +135,16 @@ class Map:
 
     def module_impact(self, f):
         """A module-level change to f: f's users and its importers' users."""
+        if self.light:
+            self.light_used = True
+            m = self.module_users(f) | self.eager_tests(f)
+            for g in self.direct_importers.get(f, ()):
+                m |= self.module_users(g)
+            return m
+        return self.module_impact_full(f)
+
+    def module_impact_full(self, f):
+        """Every test that imports f, directly or not: f may fail to import."""
         m = self.module_users(f) | self.eager_tests(f)
         for g in self.importers.get(f, ()):
             m |= self.module_users(g)
@@ -360,6 +377,13 @@ class Tree:
         self.tree = ast.parse(text)
         self._funcs = None
         self._toplevel = None
+        self._dump = None
+        self._strings = None
+
+    def dump(self):
+        if self._dump is None:
+            self._dump = ast.dump(self.tree)
+        return self._dump
 
     def funcs(self):
         """qualname -> (first line incl. decorators, last line) of every def."""
@@ -499,6 +523,7 @@ class Selector:
         self.tests = tests
         self.m = m
         self.old_cache = {}
+        self.new_cache = {}
 
     def old_text(self, f):
         p = SRC / f
@@ -511,7 +536,7 @@ class Selector:
         return t
 
     # -- one commit
-    def select(self, patch_text):
+    def select(self, patch_text, light=False):
         """(must, maybe, files) for one patch.
 
         must   tests to select no matter what: readers of changed non-Python
@@ -520,8 +545,10 @@ class Selector:
                patched code can confirm or rule out
         files  path -> patched text of every changed Python file
         """
+        self.m.light, self.m.light_used = light, False
         self.must = 0
         self.files = {}
+        self.deleted = set()  # Python files the patch deletes or renames away
         self.touched = set()  # (file, line): old lines a change inside function bodies touches
         self.nonline = False  # a change that is not just lines inside functions
         self.nonline_files = set()  # files with such a change
@@ -575,6 +602,11 @@ class Selector:
         if not py:
             return 0
 
+        if d.old != d.new and d.old is not None:
+            self.deleted.add(d.old)
+        if d.new is not None and d.new != d.old and d.new.endswith(".py"):
+            # Served to the checks that import the patched code.
+            self.files[d.new] = "\n".join(apply_hunks([], d.hunks)[0]) if d.old is None else None
         if d.old is None:
             # A new module runs only if something imports it, and that
             # importer's change is analysed on its own.
@@ -582,7 +614,12 @@ class Selector:
             return 0
         if d.new is None or d.old != d.new:
             log(f"  {d.old}: deleted or renamed module")
-            self.must |= m.module_impact(d.old)
+            self.must |= m.module_impact_full(d.old)
+            if d.new is not None:
+                old_text = self.old_text(d.old)
+                if old_text is None:
+                    raise ValueError("old file missing from source tree")
+                self.files[d.new] = "\n".join(apply_hunks(old_text.split("\n"), d.hunks)[0])
             return 0
 
         f = d.old
@@ -594,14 +631,23 @@ class Selector:
         new_text = "\n".join(new_lines)
         old = self.old_tree(f, old_text)
         try:
-            new = Tree(new_text)
+            # Both selection passes of a commit see the same patched text.
+            new = self.new_cache.get((f, new_text))
+            if new is None:
+                new = Tree(new_text)
+                self.new_cache = {(f, new_text): new, **{k: v for k, v in self.new_cache.items() if k[0] != f}}
         except SyntaxError as e:
             log(f"  {f}: no longer parses ({e.msg}); module impact")
-            self.must |= m.module_impact(f)
+            self.must |= m.module_impact_full(f)
             return 0
         self.files[f] = new_text
-        if ast.dump(old.tree) == ast.dump(new.tree):
+        if old.dump() == new.dump():
             log(f"  {f}: same syntax tree (comments or formatting)")
+            return 0
+        if strings_only(old, new, old_lines, new_lines, groups) and without_strings(old_text) == without_strings(new_text):
+            # Only docstrings (or other bare string statements) changed: no
+            # collected test reads __doc__ (pytest does not run the doctests).
+            log(f"  {f}: only docstrings changed")
             return 0
         mask = 0
         for g in groups:
@@ -696,13 +742,13 @@ class Selector:
                 if q in ("__getattr__", "__dir__"):
                     # A module's lazy attribute hook (PEP 562): its results are
                     # cached in the module, so later importers never run it.
-                    mask |= m.module_impact(f)
+                    mask |= m.module_impact_full(f)
                 return mask
             # New side: find the same function in the old tree and use the old
             # statements around where the new code went in.
             mask = self.runtime_in_old(f, old, q, scope, old_span)
             if q in ("__getattr__", "__dir__"):
-                mask |= m.module_impact(f)
+                mask |= m.module_impact_full(f)
             return mask
         if kind == "def":
             _, q, name, path, idx = c
@@ -731,7 +777,9 @@ class Selector:
                 elif may_raise(path, s):
                     # Class bodies run at import: if this one now raises, the
                     # whole module fails to import.
-                    mask |= m.module_impact(f)
+                    mask |= m.module_impact(f) | self.attr_mask(f, cq, s, a, b)
+                elif is_bare_string(s):
+                    pass  # a docstring
                 else:
                     mask |= self.attr_mask(f, cq, s, a, b)
             if not stmts and side == "new":
@@ -747,18 +795,53 @@ class Selector:
                 if side == "old" or s.name in old.funcs():
                     mask |= self.func_mask(f, old, s.name)
                 elif s.name in old.toplevel_names():
-                    mask |= m.module_impact(f)
+                    mask |= m.module_impact(f) | self.name_mask(f, {s.name}, side, s)
             elif isinstance(s, ast.ClassDef):
                 if side == "old" or s.name in old.toplevel_names():
                     mask |= m.class_users(f, s.name) | m.eager_tests(f)
+            elif is_bare_string(s):
+                pass  # a docstring
+            elif m.light and (names := bound_names(s)) is not None:
+                # An import or a plain assignment: what can see it is code that
+                # names what it binds (here or anywhere else), and whatever
+                # was built from those names while modules imported.
+                m.light_used = True
+                mask |= self.name_mask(f, names, side, s) | m.eager_tests(f)
             else:
-                mask |= m.module_impact(f)
-            if side == "old" and a <= start(s) and end(s) <= b:
-                # A whole top-level def or class went away: importers of the
-                # name break at import time.
-                mask |= m.module_impact(f)
+                mask |= m.module_impact_full(f)
+            if side == "old" and a <= start(s) and end(s) <= b and not is_bare_string(s):
+                # A whole top-level statement went away: importers of what it
+                # bound break at import time (which the import check rules
+                # out in light mode), and code using it breaks when it runs.
+                if not m.light:
+                    mask |= m.module_impact(f)
+                elif isinstance(s, FUNCS + (ast.ClassDef,)):
+                    mask |= self.name_mask(f, {s.name}, side, s)
+                elif bound_names(s) is None:
+                    mask |= m.module_impact_full(f)
         if not stmts and side == "new":
-            mask |= m.module_impact(f)
+            mask |= m.module_impact_full(f)
+        return mask
+
+    def name_mask(self, f, names, side, stmt):
+        """Tests that run a line using any of `names` from module f: in f
+        (other than the changed statement itself), or in another file through
+        f's namespace (an import from f, `alias.name`, or the same through a
+        module that re-exports f's names, like `exp`), plus the users of
+        modules whose import ran such a line."""
+        m = self.m
+        m.light_used = True
+        skip = set(range(stmt.lineno, stmt.end_lineno + 1)) if side == "old" else set()
+        mask = 0
+        for g, uses in name_references(f, names).items():
+            lines = [ln for ln in uses if not (g == f and ln in skip)]
+            mask |= m.line_users(g, lines)
+            for ln in lines:
+                # Used while g imports (module or class code): what g built
+                # with it; used in a body: only if that body ran at import.
+                imp = (m.import_lines if uses[ln] else m.import_func_lines).get(g, {})
+                for mod in imp.get(str(ln), ()):
+                    mask |= m.all if mod == "?" else m.module_impact(mod)
         return mask
 
     def lines_mask(self, f, lines, import_lines=None):
@@ -770,13 +853,13 @@ class Selector:
         self.nonline_files.add(f)  # the def statement itself runs at import
         r = old.funcs().get(q)
         if r is None:
-            return self.m.module_impact(f)
+            return self.m.module_impact_full(f)
         lines = range(r[0], r[1] + 1)
         mask = self.lines_mask(f, lines, import_lines=range(r[2], r[1] + 1))
         if q in ("__getattr__", "__dir__"):
             # A module's lazy attribute hook (PEP 562): what it resolves is
             # cached in the module, so only the first importer ever ran it.
-            mask |= self.m.module_impact(f)
+            mask |= self.m.module_impact_full(f)
         return mask
 
     def outer_users(self, f, cq):
@@ -838,7 +921,7 @@ class Selector:
                 return m.class_users(f, qualname(path, i))
             if isinstance(path[i], FUNCS):
                 return self.func_mask(f, old, qualname(path, i))
-        return m.module_impact(f) if name in old.toplevel_names() else 0
+        return m.module_impact(f) | self.name_mask(f, {name}, "new", None) if name in old.toplevel_names() else 0
 
     def runtime_in_old(self, f, old, q, scope, old_span):
         a, b = old_span
@@ -847,7 +930,7 @@ class Selector:
             c = classify(old, a, b)
             if c[0] == "runtime":
                 return self.lines_mask(f, runtime_lines(c[1], c[2], a, b))
-            return self.side_mask(f, old, old, a, b, "old", old_span) or self.m.module_impact(f)
+            return self.side_mask(f, old, old, a, b, "old", old_span) or self.m.module_impact_full(f)
         r = old.funcs().get(q)
         if r is None:
             # A brand-new function; its callers are changed elsewhere in the
@@ -996,6 +1079,244 @@ def may_raise(path, s):
     if isinstance(node, ast.UnaryOp):
         return not isinstance(node.operand, ast.Constant)
     return isinstance(node, (ast.BinOp, ast.BoolOp, ast.Compare, ast.Subscript))
+
+
+def is_bare_string(s):
+    """A statement that is only a string literal (a docstring, or a no-op)."""
+    return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str)
+
+
+def _string_lines(tree):
+    lines = set()
+    for node in ast.walk(tree):
+        for field in STMT_LISTS:
+            body = getattr(node, field, None)
+            if isinstance(body, list):
+                for x in body:
+                    if is_bare_string(x):
+                        lines.update(range(x.lineno, x.end_lineno + 1))
+    return lines
+
+
+def strings_only(old, new, old_lines, new_lines, groups):
+    """Does every changed line sit in a bare string statement (or is it blank
+    or a comment) on both sides? A cheap test before comparing whole trees."""
+    if old._strings is None:
+        old._strings = _string_lines(old.tree)
+    for o0, o1, _n0, _n1 in groups:
+        for ln in range(o0, o1):
+            if ln not in old._strings and not is_trivial(old_lines[ln - 1]):
+                return False
+    news = _string_lines(new.tree)
+    for _o0, _o1, n0, n1 in groups:
+        for ln in range(n0, n1):
+            if ln not in news and not is_trivial(new_lines[ln - 1]):
+                return False
+    return True
+
+
+def without_strings(text):
+    """The syntax tree of text with bare string statements left out."""
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        for field in STMT_LISTS:
+            body = getattr(node, field, None)
+            if isinstance(body, list):
+                body[:] = [x for x in body if not is_bare_string(x)]
+    return ast.dump(tree)
+
+
+def bound_names(s):
+    """Names a module-level import or plain assignment binds, or None for
+    any other statement (whose effects could reach anything)."""
+    if isinstance(s, (ast.Import, ast.ImportFrom)):
+        names = set()
+        for a in s.names:
+            if a.name == "*":
+                return None
+            names.add((a.asname or a.name).split(".")[0])
+        return names
+    if isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        names = set()
+        for t in s.targets if isinstance(s, ast.Assign) else [s.target]:
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name):
+                    names.add(n.id)
+                elif not isinstance(n, (ast.Tuple, ast.List, ast.Starred, ast.expr_context)):
+                    return None  # X[k] = v, obj.attr = v: changes another object
+        return names or None
+    return None
+
+
+_SOURCES = None
+
+
+def source_texts():
+    """path -> text of every Python file under sqlglot/ and tests/ at the
+    pinned commit."""
+    global _SOURCES
+    if _SOURCES is None:
+        _SOURCES = {}
+        for top in ("sqlglot", "tests"):
+            for dirpath, _dirs, names in os.walk(SRC / top):
+                for name in names:
+                    if name.endswith(".py"):
+                        p = Path(dirpath) / name
+                        _SOURCES[str(p.relative_to(SRC))] = p.read_text(encoding="utf-8", errors="replace")
+    return _SOURCES
+
+
+def module_of(path):
+    name = path[:-3].replace("/", ".")
+    return name[: -len(".__init__")] if name.endswith(".__init__") else name
+
+
+_TREES = {}
+
+
+def source_tree(path):
+    t = _TREES.get(path)
+    if t is None:
+        try:
+            t = ast.parse(source_texts()[path])
+        except SyntaxError:
+            t = ast.Module(body=[], type_ignores=[])
+        _TREES[path] = t
+    return t
+
+
+def _resolve_from(path, node):
+    """The absolute module an ImportFrom in `path` imports from."""
+    if not node.level:
+        return node.module or ""
+    pkg = module_of(path) if path.endswith("__init__.py") else module_of(path).rpartition(".")[0]
+    parts = pkg.split(".")
+    parts = parts[: len(parts) - node.level + 1]
+    return ".".join(parts + ([node.module] if node.module else []))
+
+
+# `from sqlglot import exp`: sqlglot/__init__ binds exp to the expressions package.
+_MODULE_ALIASES = {"sqlglot.exp": "sqlglot.expressions"}
+
+
+def _uses(tree, match):
+    """{line: runs at import?} of the nodes `match` accepts: True when one on
+    that line sits in module or class code rather than a function body."""
+    out = {}
+
+    def walk(node, in_func):
+        for child in ast.iter_child_nodes(node):
+            inner = in_func or isinstance(child, FUNCS + (ast.Lambda,))
+            # A def's decorators and defaults run where the def is.
+            if isinstance(child, FUNCS + (ast.Lambda,)):
+                for x in [*getattr(child, "decorator_list", ()), *child.args.defaults,
+                          *[d for d in child.args.kw_defaults if d is not None]]:
+                    walk_one(x, in_func)
+            if match(child):
+                ln = child.lineno
+                out[ln] = out.get(ln, False) or not in_func
+            walk(child, inner)
+
+    def walk_one(node, in_func):
+        if match(node):
+            out[node.lineno] = out.get(node.lineno, False) or not in_func
+        walk(node, in_func)
+
+    walk(tree, False)
+    return out
+
+
+def name_references(f, names):
+    """{path: {line: runs at import?}} of the uses of `names` as defined by
+    module f: in f itself, and elsewhere through f's namespace."""
+    srcs = source_texts()
+    modules = {module_of(p) for p in srcs}
+    fm = module_of(f)
+    # Modules whose namespace holds f's names: f, modules that star-import a
+    # holder, and modules that import the name itself from a holder (at
+    # module level); grown to a fixpoint.
+    holders = {fm: set(names)}
+    changed = True
+    while changed:
+        changed = False
+        tails = re.compile(r"\b(?:" + "|".join(sorted({h.rpartition(".")[2] for h in holders} | {"exp"})) + r")\b")
+        for g, text in srcs.items():
+            if not tails.search(text):
+                continue
+            gm = module_of(g)
+            for node in source_tree(g).body:
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                src = _MODULE_ALIASES.get(_resolve_from(g, node), _resolve_from(g, node))
+                held = holders.get(src)
+                if not held:
+                    continue
+                for a in node.names:
+                    if a.name == "*":
+                        new = {n for n in held if not n.startswith("_")}
+                    elif a.name in held:
+                        new = {a.asname or a.name}
+                    else:
+                        continue
+                    if not new <= holders.get(gm, set()):
+                        holders.setdefault(gm, set()).update(new)
+                        changed = True
+    every = set().union(*holders.values())
+    pat = re.compile(r"\b(?:" + "|".join(sorted(map(re.escape, every))) + r")\b")
+    out = {}
+    for g, text in srcs.items():
+        if not pat.search(text):
+            continue
+        gm = module_of(g)
+        tree = source_tree(g)
+        if gm == fm:
+            uses = _uses(tree, lambda n: isinstance(n, ast.Name) and n.id in names)
+            if uses:
+                out[g] = uses
+            continue
+        # Local names bound to a holder module, and names imported from one.
+        mod_alias, name_alias, import_lines = {}, set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.asname:
+                        mod_alias[a.asname] = a.name
+                    else:
+                        mod_alias.setdefault(a.name.split(".")[0], a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                src = _MODULE_ALIASES.get(_resolve_from(g, node), _resolve_from(g, node))
+                held = holders.get(src, ())
+                for a in node.names:
+                    full = _MODULE_ALIASES.get(f"{src}.{a.name}", f"{src}.{a.name}")
+                    if full in modules or full in holders:
+                        mod_alias[a.asname or a.name] = full
+                    if a.name == "*" and held:
+                        name_alias.update(held)
+                        import_lines.add(node.lineno)
+                    elif a.name in held:
+                        name_alias.add(a.asname or a.name)
+                        import_lines.add(node.lineno)
+
+        def dotted(e):
+            if isinstance(e, ast.Name):
+                return mod_alias.get(e.id)
+            if isinstance(e, ast.Attribute):
+                base = dotted(e.value)
+                return None if base is None else _MODULE_ALIASES.get(f"{base}.{e.attr}", f"{base}.{e.attr}")
+            return None
+
+        def match(n):
+            if isinstance(n, ast.Name):
+                return n.id in name_alias
+            if isinstance(n, ast.Attribute):
+                base = dotted(n.value)
+                return base is not None and n.attr in holders.get(base, ())
+            return isinstance(n, ast.ImportFrom) and n.lineno in import_lines
+
+        uses = _uses(tree, match)
+        if uses:
+            out[g] = uses
+    return out
 
 
 def assigned_names(s):
@@ -1192,6 +1513,8 @@ def split(numbers, ms):
 # it here costs its seconds of CPU. So we only run the cheap candidates, and
 # only when the best outcome (they all pass) beats listing everything.
 
+# Smallest saving worth an import check (which costs about half a second).
+IMPORT_CHECK_MS = int(os.environ.get("BR_IMPORT_CHECK_MS", 1000))
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", 1500))  # never run these here
 VERIFY_MAX_MS = int(os.environ.get("BR_VERIFY_MAX_MS", 4000))
 # With no heavy candidate to drop, a verification can only save a worker or
@@ -1267,6 +1590,52 @@ def tpcds_queries(tp, sel, m, must, maybe):
     return sorted(numbers_of(affected, max(tp["baseline"]) + 1), key=lambda i: tp["cost"].get(i, 0))
 
 
+def run_import_checks(plans):
+    """For each plan with a light selection (one that assumes every module
+    still imports), import everything on the patched code; any module or
+    test file that imported at the pinned commit and now fails sends the
+    plan back to its full selection."""
+    todo = [p for p in plans if p["full"]]
+    if not todo:
+        return
+    sys.path.insert(0, str(HERE))
+    import verify
+
+    test_files = sorted(TESTS_BY_FILE)
+    h = verify.start_import_check(SRC, {}, (), test_files)
+    while (res := verify.poll_json(h, 60)) is None:
+        time.sleep(0.01)
+    status, baseline = res
+    if status != "done":
+        log(f"import check baseline failed ({status}); using full selections")
+        for p in todo:
+            p["must"], p["maybe"] = p["full"]
+        return
+    baseline = set(baseline)
+    queue, running = list(todo), []
+    while queue or running:
+        while queue and len(running) < PARALLEL:
+            p = queue.pop(0)
+            running.append((p, verify.start_import_check(SRC, p["files"], p["deleted"], test_files)))
+        still = []
+        for p, h in running:
+            res = verify.poll_json(h, 30)
+            if res is None:
+                still.append((p, h))
+                continue
+            status, failed = res
+            broken = None if status != "done" else sorted(set(failed) - baseline)
+            if broken == []:
+                log(f"{p['commit']}: everything still imports ({h.get('cpu', 0):.2f} s CPU); light selection")
+            else:
+                log(f"{p['commit']}: import check {'failed: ' + ', '.join(broken[:5]) if broken else status}; "
+                    f"full selection")
+                p["must"], p["maybe"] = p["full"]
+        running = still
+        if running:
+            time.sleep(0.01)
+
+
 def run_tpcds_checks(tp, plans):
     todo = [p for p in plans if p.get("tpcds")]
     if not todo:
@@ -1279,7 +1648,7 @@ def run_tpcds_checks(tp, plans):
         while queue and len(running) < PARALLEL:
             p = queue.pop(0)
             running.append((p, verify.start_tpcds(SRC, p["files"], p["tpcds"],
-                                                  {i: tp["baseline"][i] for i in p["tpcds"]})))
+                                                  {i: tp["baseline"][i] for i in p["tpcds"]}, p["deleted"])))
         still = []
         for p, h in running:
             # A check runs about as long as its queries did at the pinned
@@ -1327,11 +1696,34 @@ def main():
     plans = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         log(f"{patch.stem}:")
-        must, maybe, files = sel.select(patch.read_text(encoding="utf-8", errors="replace"))
-        light = maybe & ~heavy
-        hv = maybe & heavy
-        plan = {"commit": patch.stem, "must": must, "light": light, "heavy": hv, "files": files,
-                "verify": False, "tpcds": tpcds_queries(tp, sel, m, must, maybe)}
+        text = patch.read_text(encoding="utf-8", errors="replace")
+        must, maybe, files = sel.select(text, light=True)
+        plan = {"commit": patch.stem, "must": must, "maybe": maybe, "files": files, "deleted": set(sel.deleted),
+                "verify": False, "full": None}
+        if m.light_used:
+            # Both are sound when the patched code still imports everywhere,
+            # and only the full one otherwise: an import check decides,
+            # when it can save more than it costs.
+            fmust, fmaybe, _ = sel.select(text, light=False)
+            both = fmust | fmaybe
+            must, maybe = must & both, maybe & both
+            saving = cost_of(split(numbers_of(both, n), ms), ms) - cost_of(split(numbers_of(must | maybe, n), ms), ms)
+            if saving > IMPORT_CHECK_MS:
+                plan["must"], plan["maybe"] = must, maybe
+                plan["full"] = (fmust, fmaybe)
+            else:
+                plan["must"], plan["maybe"] = fmust, fmaybe
+            must, maybe = fmust, fmaybe
+        plan["tpcds"] = tpcds_queries(tp, sel, m, must, maybe)
+        plans.append(plan)
+
+    run_import_checks(plans)
+
+    for plan in plans:
+        must, maybe = plan["must"], plan["maybe"]
+        plan["light"], plan["heavy"] = maybe & ~heavy, maybe & heavy
+        if plan["tpcds"] and not (must | maybe) >> tp["num"] & 1:
+            plan["tpcds"] = None
         if plan["tpcds"]:
             # Worth checking only if dropping the test would really cut this
             # commit's cost (another heavy test may set the pace anyway).
@@ -1340,8 +1732,10 @@ def main():
             saving = cost_of(split(everything, ms), ms) - cost_of(split(without, ms), ms)
             check_ms = 300 + 1050 * sum(tp["cost"].get(i, 0.1) for i in plan["tpcds"])
             if TPCDS_HIT_RATE * saving <= check_ms:
-                log(f"  TPC-DS check skipped: saves {saving / 1000:.1f} s at best, costs ~{check_ms / 1000:.1f} s")
+                log(f"{plan['commit']}: TPC-DS check skipped: saves {saving / 1000:.1f} s at best, "
+                    f"costs ~{check_ms / 1000:.1f} s")
                 plan["tpcds"] = None
+        light, hv = plan["light"], plan["heavy"]
         if VERIFY and light:
             sum_l = sum(ms[i] for i in numbers_of(light, n))
             listed = cost_of(split(numbers_of(must | maybe, n), ms), ms)
@@ -1351,7 +1745,6 @@ def main():
             if sum_l <= limit and best < listed:
                 plan["verify"] = True
                 plan["sum_l"] = sum_l
-        plans.append(plan)
 
     if os.environ.get("BR_DUMP"):
         with open(os.environ["BR_DUMP"], "w") as fh:

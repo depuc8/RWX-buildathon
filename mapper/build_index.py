@@ -311,6 +311,8 @@ def main():
         "import_lines": import_lines,
         "import_func_lines": import_func_lines,
         "importers": closure,
+        # Modules that import each module directly (at any level, as written).
+        "direct_importers": {f: sorted(v) for f, v in sorted(importers.items())},
         "tracked": imp.get("tracked", []),
         "import_reads": _import_reads(imp.get("import_reads", [])),
         "import_users": {

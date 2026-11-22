@@ -547,6 +547,67 @@ def start_tpcds(src, files, indices, baseline=None, deleted=(), attrs=None, runs
     return {"pid": pid, "fd": r, "buf": b"", "t0": time.monotonic()}
 
 
+def _max_nodes_scaled(scale):
+    """tests/test_parser.py's test_max_nodes with its big statement and its
+    two limits divided by scale. The statement's AST node count is its width
+    times a constant plus a constant, so a limit is exceeded in the small run
+    exactly when it is in the big one. Returns (passed, CPU seconds the two
+    big parses took)."""
+    import tests.test_parser  # noqa: F401  (the test module must still import)
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+
+    if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+        return False, 0.0
+    cols = [f"col{i}" for i in range(500)]
+    if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
+        return False, 0.0
+    width, depth = 10000 // scale, 100
+    sql = "SELECT " + ",".join(["x" + "=x" * depth] * width)
+    t0 = time.process_time()
+    for limit, needle in ((1_000_000 // scale, "Maximum number of AST nodes"), (50_000 // scale, f"({50_000 // scale})")):
+        try:
+            parse_one(sql, max_nodes=limit)
+            return False, 0.0
+        except ParseError as e:
+            if needle not in str(e):
+                return False, 0.0
+    spent = time.process_time() - t0
+    try:
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+        return False, spent
+    except ParseError:
+        pass
+    return isinstance(parse_one("SELECT 1, 2, 3"), exp.Select), spent
+
+
+def start_max_nodes(src, files, deleted=(), scale=100):
+    """Fork a child that runs _max_nodes_scaled on the patched files (none:
+    the pinned commit, for a time to compare with). Returns a handle for
+    poll_json; the answer is {"ok": bool, "cpu": seconds}."""
+    global SRC
+    SRC = str(src)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+            os.chdir(SRC)
+            sys.path.insert(0, SRC)
+            sys.dont_write_bytecode = True
+            _like_pytest()
+            sys.meta_path.insert(0, _Overlay(files, deleted))
+            ok, spent = _max_nodes_scaled(scale)
+            os.write(w, json.dumps({"ok": bool(ok), "cpu": spent}).encode())
+        except BaseException:  # noqa: BLE001
+            pass
+        os._exit(0)
+    os.close(w)
+    return {"pid": pid, "fd": r, "buf": b"", "t0": time.monotonic()}
+
+
 def poll_json(handle, timeout):
     """Non-blocking: ("done", object) once the child wrote its answer,
     ("failed", None) if it died, timed out or wrote nothing; None meanwhile."""

@@ -1945,6 +1945,85 @@ def run_import_checks(plans, m):
             time.sleep(0.01)
 
 
+def patch_paths(text):
+    """Every path a patch names, or None when it does not parse."""
+    try:
+        return {p for d in parse_patch(text) for p in (d.old, d.new) if p}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# test_max_nodes takes 29 recorded seconds, more than any other test, to parse
+# one huge statement under node limits. A copy cut a hundredfold (same
+# queries, same depth, limits scaled with the statement) costs a fraction of a
+# second here and fails whenever the big one would: run it and drop the test
+# when it passes. Only for patches that touch nothing but sqlglot's Python
+# files, so the test module itself is the pinned one.
+MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+MAX_NODES_CHECK_MS = int(os.environ.get("BR_MAX_NODES_CHECK_MS", 1000))  # smallest saving worth a check
+MAX_NODES = os.environ.get("BR_MAX_NODES", "1") == "1"
+# Slower than the pinned commit by more than this: maybe a timeout in the real
+# test, so it stays.
+MAX_NODES_SLOWDOWN = float(os.environ.get("BR_MAX_NODES_SLOWDOWN", 3))
+
+
+def run_max_nodes_checks(plans, tests, ms):
+    num = next((t["number"] for t in tests if t["id"] == MAX_NODES_ID), None)
+    if not MAX_NODES or num is None:
+        return
+    n = len(tests)
+    bit = 1 << num
+    todo = []
+    for p in plans:
+        if not p["maybe"] & bit or p["must"] & bit or not p["paths"]:
+            continue
+        if not all(f.startswith("sqlglot/") and f.endswith(".py") for f in p["paths"]):
+            continue
+        everything = numbers_of(p["must"] | p["maybe"], n)
+        saving = cost_of(split(everything, ms), ms) - cost_of(split([i for i in everything if i != num], ms), ms)
+        if saving > MAX_NODES_CHECK_MS:
+            todo.append(p)
+    if not todo:
+        return
+    sys.path.insert(0, str(HERE))
+    import verify
+
+    def wait(h, timeout):
+        while (res := verify.poll_json(h, timeout)) is None:
+            time.sleep(0.005)
+        return res
+
+    status, base = wait(verify.start_max_nodes(SRC, {}), 30)
+    if status != "done" or not base.get("ok"):
+        log(f"test_max_nodes check fails on the pinned commit ({status}); keeping the test")
+        return
+    limit = MAX_NODES_SLOWDOWN * base["cpu"] + 0.05
+    queue, running = list(todo), []
+    while queue or running:
+        while queue and len(running) < PARALLEL:
+            p = queue.pop(0)
+            if time.monotonic() - START > CHECK_DEADLINE:
+                log(f"{p['commit']}: out of time for a test_max_nodes check; kept")
+                continue
+            running.append((p, verify.start_max_nodes(SRC, p["files"], p["deleted"])))
+        still = []
+        for p, h in running:
+            res = verify.poll_json(h, 10 + 20 * limit)
+            if res is None:
+                still.append((p, h))
+                continue
+            status, out = res
+            ok = status == "done" and out.get("ok") and out.get("cpu", 1e9) <= limit
+            if ok:
+                p["maybe"] &= ~bit
+            log(f"{p['commit']}: test_max_nodes check {'passed: dropped' if ok else 'failed: kept'} "
+                f"({h.get('cpu', 0):.2f} s CPU; parses {out.get('cpu', -1) if out else -1:.3f} s, "
+                f"pinned {base['cpu']:.3f} s)")
+        running = still
+        if running:
+            time.sleep(0.005)
+
+
 def run_tpcds_checks(tp, plans):
     todo = [p for p in plans if p.get("tpcds")]
     if not todo:
@@ -2015,7 +2094,8 @@ def main():
         text = patch.read_text(encoding="utf-8", errors="replace")
         must, maybe, files = sel.select(text, light=True)
         plan = {"commit": patch.stem, "must": must, "maybe": maybe, "files": files, "deleted": set(sel.deleted),
-                "verify": False, "full": None, "state": sel.state_check, "risk": sel.import_risk}
+                "verify": False, "full": None, "state": sel.state_check, "risk": sel.import_risk,
+                "paths": patch_paths(text)}
         if m.light_used or sel.import_risk:
             # Both are sound when the patched code still imports everywhere,
             # and only the full one otherwise: an import check decides,
@@ -2037,6 +2117,7 @@ def main():
         plans.append(plan)
 
     run_import_checks(plans, m)
+    run_max_nodes_checks(plans, tests, ms)
 
     for plan in plans:
         must, maybe = plan["must"], plan["maybe"]

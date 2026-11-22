@@ -585,6 +585,10 @@ class Selector:
         """
         self.m.light, self.m.light_used = light, False
         self.state_check = False  # the light selection needs the import check's state diff
+        # A change that may make an import fail: only the import check can tell
+        # which tests that breaks (dialects are loaded by name, which no static
+        # import map sees), so it always runs.
+        self.import_risk = False
         self.must = 0
         self.files = {}
         self.deleted = set()  # Python files the patch deletes or renames away
@@ -657,6 +661,7 @@ class Selector:
             return 0
         if d.new is None or d.old != d.new:
             log(f"  {d.old}: deleted or renamed module")
+            self.import_risk = True
             self.must |= m.module_impact_full(d.old)
             if d.new is not None:
                 old_text = self.old_text(d.old)
@@ -681,6 +686,7 @@ class Selector:
                 self.new_cache = {(f, new_text): new, **{k: v for k, v in self.new_cache.items() if k[0] != f}}
         except SyntaxError as e:
             log(f"  {f}: no longer parses ({e.msg}); module impact")
+            self.import_risk = True
             self.must |= m.module_impact_full(f)
             return 0
         self.files[f] = new_text
@@ -816,11 +822,13 @@ class Selector:
             return mask
         if kind == "def":
             _, q, name, path, idx = c
+            # Decorators and defaults run at import.
+            risk = self.risky(f) if may_raise(path) else 0
             if side == "old":
-                return self.func_mask(f, old, q)
+                return self.func_mask(f, old, q) | risk
             if q in old.funcs():
-                return self.func_mask(f, old, q)
-            return self.new_def_mask(f, old, path, idx, name)
+                return self.func_mask(f, old, q) | risk
+            return self.new_def_mask(f, old, path, idx, name) | risk
         if kind == "class":
             _, path, idx = c
             cls = path[idx]
@@ -829,7 +837,10 @@ class Selector:
             mask = 0
             for s in stmts:
                 if isinstance(s, FUNCS):
+                    # A def added, removed or reshaped in the class body: its
+                    # decorators and defaults run when the class is created.
                     sq = f"{cq}.{s.name}" if cq else s.name
+                    mask |= self.risky(f)
                     if side == "old" or sq in old.funcs():
                         mask |= self.func_mask(f, old, sq)
                     else:
@@ -837,12 +848,12 @@ class Selector:
                         mask |= m.class_users(f, cq)
                 elif isinstance(s, ast.ClassDef):
                     self.mark(f, "newdef")
-                    mask |= m.class_users(f, f"{cq}.{s.name}") | m.class_users(f, cq)
+                    mask |= m.class_users(f, f"{cq}.{s.name}") | m.class_users(f, cq) | self.risky(f)
                 elif may_raise(path, s):
                     # Class bodies run at import: if this one now raises, the
                     # whole module fails to import.
                     self.mark(f, "class")
-                    mask |= m.module_impact(f) | self.attr_mask(f, cq, s, a, b)
+                    mask |= self.risky(f) | self.attr_mask(f, cq, s, a, b)
                 elif is_bare_string(s):
                     pass  # a docstring
                 else:
@@ -857,13 +868,16 @@ class Selector:
         mask = 0
         for s in stmts:
             if isinstance(s, FUNCS):
+                if may_raise(path_to(tree.tree, a, b)):
+                    mask |= self.risky(f)  # decorators and defaults run at import
                 if side == "old" or s.name in old.funcs():
                     mask |= self.func_mask(f, old, s.name)
                 elif s.name in old.toplevel_names():
                     self.mark(f, "newdef")
-                    mask |= m.module_impact(f) | self.name_mask(f, {s.name}, side, s)
+                    mask |= self.risky(f) | self.name_mask(f, {s.name}, side, s)
             elif isinstance(s, ast.ClassDef):
                 self.mark(f, "newdef")
+                mask |= self.risky(f)  # a class header (bases, decorators) runs at import
                 if side == "old" or s.name in old.toplevel_names():
                     mask |= m.class_users(f, s.name) | m.eager_tests(f)
             elif is_bare_string(s):
@@ -871,6 +885,8 @@ class Selector:
             else:
                 names = bound_names(s)
                 self.mark(f, "module", names)
+                if may_raise(path_to(tree.tree, a, b)):
+                    self.import_risk = True  # module code runs at import
                 if m.light and names is not None:
                     # An import or a plain assignment: what can see it is code
                     # that names what it binds (here or anywhere else), and
@@ -893,8 +909,19 @@ class Selector:
                     mask |= m.module_impact_full(f)
         if not stmts and side == "new":
             self.mark(f, "module", None)
+            self.import_risk = True
             mask |= m.module_impact_full(f)
         return mask
+
+    def risky(self, f):
+        """Code that runs while f imports changed in a way that could raise:
+        the light selection leaves that to the import check (which always
+        runs then); the full one takes every importer."""
+        self.import_risk = True
+        if self.m.light:
+            self.m.light_used = True
+            return 0
+        return self.m.module_impact_full(f)
 
     def mark(self, f, kind, names=()):
         """Record a change that is not just lines in function bodies (see
@@ -1033,7 +1060,7 @@ class Selector:
                 return m.class_users(f, qualname(path, i))
             if isinstance(path[i], FUNCS):
                 return self.func_mask(f, old, qualname(path, i))
-        return m.module_impact(f) | self.name_mask(f, {name}, "new", None) if name in old.toplevel_names() else 0
+        return self.risky(f) | self.name_mask(f, {name}, "new", None) if name in old.toplevel_names() else 0
 
     def runtime_in_old(self, f, old, q, scope, old_span):
         a, b = old_span
@@ -1181,16 +1208,12 @@ def compare_differs(code, old_op, new_op):
     return new != r
 
 
-def may_raise(path, s):
-    """Does the change at the end of `path` (inside statement s) touch an
-    operation that could now raise when the statement runs, like `+` turned
-    into `-` on two lists? A change inside a literal cannot."""
-    if not path or path[-1] is s or s not in path:
-        return False
-    node = path[-1]
-    if isinstance(node, ast.UnaryOp):
-        return not isinstance(node.operand, ast.Constant)
-    return isinstance(node, (ast.BinOp, ast.BoolOp, ast.Compare, ast.Subscript))
+def may_raise(path, s=None):
+    """Could the change at the end of `path` make code that runs at import
+    raise (a class body, a decorator, a default)? Only a change confined to
+    one literal constant cannot: a different name, attribute, operator, call
+    argument (t.cast(list[str], X) swapped), or an entry removed can."""
+    return not (path and isinstance(path[-1], ast.Constant))
 
 
 def is_bare_string(s):
@@ -1822,6 +1845,26 @@ def import_baseline_one():
     print(json.dumps(out))
 
 
+def failure_impact(m, broken, files):
+    """Tests that fail when these modules, dialects and test files no longer
+    import (verify._import_everything's names), plus everything that imports
+    the patched modules."""
+    mask = 0
+    for f in files:
+        if f.endswith(".py"):
+            mask |= m.module_impact_full(f)
+    for b in broken:
+        if b.startswith("tests/"):
+            mask |= TESTS_BY_FILE.get(b, 0)
+            continue
+        mod = "sqlglot.dialects." + b.split(":", 1)[1] if b.startswith("dialect:") else b
+        path = mod.replace(".", "/")
+        for f in (path + ".py", path + "/__init__.py"):
+            if (SRC / f).exists():
+                mask |= m.module_impact_full(f)
+    return mask
+
+
 def run_import_checks(plans, m):
     """For each plan with a light selection (one that assumes every module
     still imports), import everything on the patched code; any module or
@@ -1847,6 +1890,8 @@ def run_import_checks(plans, m):
         log(f"import check baseline failed ({status}); using full selections")
         for p in todo:
             p["must"], p["maybe"] = p["full"]
+            if p["risk"]:
+                p["must"] = m.all
         return
     baseline = set(out["failed"])
     if state and "state" not in out:
@@ -1867,6 +1912,8 @@ def run_import_checks(plans, m):
             if time.monotonic() - START > CHECK_DEADLINE:
                 log(f"{p['commit']}: out of time for an import check; full selection")
                 p["must"], p["maybe"] = p["full"]
+                if p["risk"]:
+                    p["must"] = m.all  # an import may fail, and nothing tells which tests that breaks
                 continue
             running.append((p, verify.start_import_check(SRC, p["files"], p["deleted"], test_files, p["state"])))
         still = []
@@ -1883,14 +1930,16 @@ def run_import_checks(plans, m):
                 extra = diff_users(m, out.get("diff", ()), set(p["files"]) | p["deleted"])
                 if extra is None:
                     broken = ["(import-time state changed in a way that cannot be traced)"]
+            fmust, fmaybe = p["full"]
             if broken == []:
-                fmust, fmaybe = p["full"]
                 p["maybe"] |= extra & (fmust | fmaybe) & ~p["must"]
                 log(f"{p['commit']}: everything still imports ({h.get('cpu', 0):.2f} s CPU); light selection")
             else:
+                # Something no longer imports (or the check hung): every test
+                # that imports it fails, beyond what the full selection holds.
                 log(f"{p['commit']}: import check {'failed: ' + ', '.join(broken[:5]) if broken else status}; "
                     f"full selection")
-                p["must"], p["maybe"] = p["full"]
+                p["must"], p["maybe"] = fmust | failure_impact(m, broken or [], p["files"]), fmaybe
         running = still
         if running:
             time.sleep(0.01)
@@ -1966,8 +2015,8 @@ def main():
         text = patch.read_text(encoding="utf-8", errors="replace")
         must, maybe, files = sel.select(text, light=True)
         plan = {"commit": patch.stem, "must": must, "maybe": maybe, "files": files, "deleted": set(sel.deleted),
-                "verify": False, "full": None, "state": sel.state_check}
-        if m.light_used:
+                "verify": False, "full": None, "state": sel.state_check, "risk": sel.import_risk}
+        if m.light_used or sel.import_risk:
             # Both are sound when the patched code still imports everywhere,
             # and only the full one otherwise: an import check decides,
             # when it can save more than it costs.
@@ -1975,7 +2024,7 @@ def main():
             both = fmust | fmaybe
             must, maybe = must & both, maybe & both
             saving = cost_of(split(numbers_of(both, n), ms), ms) - cost_of(split(numbers_of(must | maybe, n), ms), ms)
-            if saving > (STATE_CHECK_MS if plan["state"] else IMPORT_CHECK_MS):
+            if plan["risk"] or saving > (STATE_CHECK_MS if plan["state"] else IMPORT_CHECK_MS):
                 plan["must"], plan["maybe"] = must, maybe
                 plan["full"] = (fmust, fmaybe)
             else:

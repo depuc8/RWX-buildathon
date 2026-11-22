@@ -42,6 +42,10 @@ TPCDS_HIT_RATE = float(os.environ.get("BR_TPCDS_HIT_RATE", 0.4))
 TPCDS_RUN_BUDGET = float(os.environ.get("BR_TPCDS_RUN_BUDGET", 5))
 
 MAX_WORKERS = 8
+START = time.monotonic()
+# No check starts after this many seconds of wall time (the batch must finish
+# in 3 minutes, 4.5 in the final); unchecked commits keep full selections.
+CHECK_DEADLINE = float(os.environ.get("BR_CHECK_DEADLINE", 120))
 WORKER_MS = 2000
 ALL_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini"}
 
@@ -1860,6 +1864,10 @@ def run_import_checks(plans, m):
     while queue or running:
         while queue and len(running) < PARALLEL:
             p = queue.pop(0)
+            if time.monotonic() - START > CHECK_DEADLINE:
+                log(f"{p['commit']}: out of time for an import check; full selection")
+                p["must"], p["maybe"] = p["full"]
+                continue
             running.append((p, verify.start_import_check(SRC, p["files"], p["deleted"], test_files, p["state"])))
         still = []
         for p, h in running:
@@ -1899,6 +1907,9 @@ def run_tpcds_checks(tp, plans):
     while queue or running:
         while queue and len(running) < PARALLEL:
             p = queue.pop(0)
+            if time.monotonic() - START > CHECK_DEADLINE:
+                log(f"{p['commit']}: out of time for the TPC-DS check")
+                continue
             attrs = (tp["data_attrs"], tp["attr_baseline"]) if p["tpcds_attrs"] else None
             running.append((p, verify.start_tpcds(SRC, p["files"], p["tpcds"],
                                                   {i: tp["baseline"][i] for i in p["tpcds"]}, p["deleted"], attrs,

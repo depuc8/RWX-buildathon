@@ -353,11 +353,20 @@ def _vkey(v, depth=0):
     return None if " at 0x" in r or " object at " in r else ("repr", type(v).__qualname__, r)
 
 
-def module_state():
+def _per_key(value):
+    per = {}
+    for k, x in value.items():
+        t = _ktok(k)
+        per[t] = _h((per.get(t), _vkey(x)))
+    return per
+
+
+def module_state(lazy=False):
     """What importing left behind in sqlglot's and the tests' modules:
     ({("m", file, name) or ("c", "file::Class", name): hash, or None when the
     value has no stable form}, {same key: {dict key token: hash}}, keys whose
-    value is a function)."""
+    value is a function). With lazy, the middle part holds the dicts
+    themselves, for state_diff to hash per key only where it needs to."""
     flat, keyed, funcs = {}, {}, set()
 
     def put(key, value):
@@ -366,11 +375,7 @@ def module_state():
         if callable(value) and not isinstance(value, type) or isinstance(value, (classmethod, staticmethod, property)):
             funcs.add(key)
         if isinstance(value, dict):
-            per = {}
-            for k, x in value.items():
-                t = _ktok(k)
-                per[t] = _h((per.get(t), _vkey(x)))
-            keyed[key] = per
+            keyed[key] = ("raw", value) if lazy else _per_key(value)
 
     for name, mod in list(sys.modules.items()):
         if not (name in ("sqlglot", "tests") or name.startswith(("sqlglot.", "tests."))):
@@ -417,6 +422,8 @@ def state_diff(base, new):
         vals = keys = None
         if key in bkeyed and key in nkeyed and n is not None and None not in b:
             bk, nk = bkeyed[key], nkeyed[key]
+            if isinstance(nk, tuple):
+                nk = _per_key(nk[1])  # module_state(lazy=True)
             vals = sorted(t for t in set(bk) & set(nk) if nk[t] not in bk[t])
             keys = sorted(set(bk) ^ set(nk))
         out.append([key[0], key[1], key[2], vals, keys, key in bfuncs or key in nfuncs])
@@ -449,7 +456,7 @@ def start_import_check(src, files, deleted, test_files, state=False):
             sys.meta_path.insert(0, _Overlay(files, deleted))
             out = {"failed": _import_everything(test_files)}
             if state:
-                st = module_state()
+                st = module_state(lazy=BASE_STATE is not None)
                 if BASE_STATE is None:
                     out["state"] = ([[list(k), v] for k, v in st[0].items()],
                                     [[list(k), v] for k, v in st[1].items()], [list(k) for k in st[2]])
